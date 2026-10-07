@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Job Autofiller</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            width: 400px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: #f8f9fa;
+            color: #333;
+        }
+
+        .container {
+            padding: 16px;
+        }
+
+        .header {
+            margin-bottom: 24px;
+            border-bottom: 1px solid #e0e0e0;
+            padding-bottom: 12px;
+        }
+
+        .header h1 {
+            font-size: 16px;
+            font-weight: 600;
+            color: #1a1a1a;
+        }
+
+        .header p {
+            font-size: 12px;
+            color: #666;
+            margin-top: 4px;
+        }
+
+        .section {
+            margin-bottom: 20px;
+        }
+
+        .section-title {
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            color: #666;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .status-badge {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-weight: 500;
+            letter-spacing: 0;
+        }
+
+        .status-badge.saved {
+            background-color: #d4edda;
+            color: #155724;
+        }
+
+        .status-badge.unsaved {
+            background-color: #fff3cd;
+            color: #856404;
+        }
+
+        .form-group {
+            margin-bottom: 12px;
+        }
+
+        label {
+            display: block;
+            font-size: 12px;
+            font-weight: 500;
+            margin-bottom: 6px;
+            color: #333;
+        }
+
+        input[type="password"],
+        input[type="text"],
+        textarea,
+        select {
+            width: 100%;
+            padding: 8px 10px;
+            font-size: 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-family: inherit;
+            transition: border-color 0.2s;
+        }
+
+        input[type="password"]:focus,
+        input[type="text"]:focus,
+        textarea:focus,
+        select:focus {
+            outline: none;
+            border-color: #0066cc;
+            box-shadow: 0 0 0 2px rgba(0, 102, 204, 0.1);
+        }
+
+        textarea {
+            resize: vertical;
+            min-height: 80px;
+            font-family: "Monaco", "Courier New", monospace;
+            font-size: 11px;
+        }
+
+        .button-group {
+            display: flex;
+            gap: 8px;
+            margin-top: 16px;
+        }
+
+        button {
+            flex: 1;
+            padding: 8px 12px;
+            font-size: 12px;
+            font-weight: 600;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-primary {
+            background-color: #0066cc;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background-color: #0052a3;
+        }
+
+        .btn-primary:active {
+            transform: scale(0.98);
+        }
+
+        .btn-secondary {
+            background-color: #e0e0e0;
+            color: #333;
+        }
+
+        .btn-secondary:hover {
+            background-color: #d0d0d0;
+        }
+
+        .toggle-password {
+            position: relative;
+        }
+
+        .toggle-password-btn {
+            position: absolute;
+            right: 8px;
+            top: 22px;
+            background: none;
+            border: none;
+            color: #666;
+            cursor: pointer;
+            font-size: 12px;
+            padding: 4px;
+        }
+
+        .toggle-password-btn:hover {
+            color: #333;
+        }
+
+        .info-text {
+            font-size: 11px;
+            color: #666;
+            margin-top: 6px;
+            line-height: 1.4;
+        }
+
+        .divider {
+            height: 1px;
+            background-color: #e0e0e0;
+            margin: 16px 0;
+        }
+
+        .footer {
+            border-top: 1px solid #e0e0e0;
+            padding-top: 12px;
+            font-size: 11px;
+            color: #999;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>🤖 AI Job Autofiller</h1>
+            <p>Automate job application form filling</p>
+        </div>
+
+        <!-- API Key Section -->
+        <div class="section">
+            <div class="section-title">
+                Gemini API Configuration
+                <span id="api-status" class="status-badge unsaved">Unsaved</span>
+            </div>
+            <div class="form-group toggle-password">
+                <label for="api-key">API Key</label>
+                <input
+                    type="password"
+                    id="api-key"
+                    placeholder="Paste your Gemini API key here"
+                    autocomplete="off"
+                />
+                <button class="toggle-password-btn" id="toggle-api-key">Show</button>
+            </div>
+            <div class="info-text">
+                Get your API key from <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color: #0066cc;">Google AI Studio</a>
+            </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <!-- Resume Section -->
+        <div class="section">
+            <div class="section-title">
+                Resume Text
+                <span id="resume-status" class="status-badge unsaved">Unsaved</span>
+            </div>
+            <div class="form-group">
+                <label for="resume-text">Your Resume / Summary</label>
+                <textarea
+                    id="resume-text"
+                    placeholder="Paste your resume or professional summary here..."
+                ></textarea>
+            </div>
+            <div class="info-text">
+                Used to match job requirements and generate contextual answers.
+            </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <!-- Portfolio & Links Section -->
+        <div class="section">
+            <div class="section-title">
+                Portfolio & Professional Links
+                <span id="portfolio-status" class="status-badge unsaved">Unsaved</span>
+            </div>
+            <div class="form-group">
+                <label for="portfolio-url">Portfolio / Personal Website URL</label>
+                <input
+                    type="url"
+                    id="portfolio-url"
+                    placeholder="https://yourportfolio.com"
+                />
+            </div>
+            <div class="form-group">
+                <label for="github-url">GitHub / Work Samples URL</label>
+                <input
+                    type="url"
+                    id="github-url"
+                    placeholder="https://github.com/yourprofile"
+                />
+            </div>
+            <div class="form-group">
+                <label for="linkedin-url">LinkedIn Profile URL</label>
+                <input
+                    type="url"
+                    id="linkedin-url"
+                    placeholder="https://linkedin.com/in/yourprofile"
+                />
+            </div>
+            <div class="info-text">
+                These links will be auto-filled into matching portfolio, work sample, or professional profile fields on applications.
+            </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <!-- Cover Letter Section -->
+        <div class="section">
+            <div class="section-title">
+                Cover Letter
+                <span id="cover-letter-status" class="status-badge unsaved">Unsaved</span>
+            </div>
+            <div class="form-group">
+                <label for="cover-letter-text">Cover Letter Content</label>
+                <textarea
+                    id="cover-letter-text"
+                    placeholder="Paste your cover letter content here. It will be auto-filled into cover letter fields on job applications..."
+                    style="min-height: 120px;"
+                ></textarea>
+            </div>
+            <div class="info-text">
+                Keep it generic but personable. The extension will auto-fill this into cover letter fields.
+            </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <!-- Resume PDF Section -->
+        <div class="section">
+            <div class="section-title">
+                Resume PDF Upload
+                <span id="pdf-status" class="status-badge unsaved">No PDF</span>
+            </div>
+            <div class="form-group">
+                <label for="resume-pdf">Upload Resume (PDF)</label>
+                <input
+                    type="file"
+                    id="resume-pdf"
+                    accept=".pdf"
+                    style="padding: 6px; cursor: pointer;"
+                />
+            </div>
+            <div id="pdf-info" class="info-text" style="display: none; margin-top: 8px;">
+                <strong id="pdf-filename"></strong><br>
+                <small id="pdf-size"></small><br>
+                <small id="pdf-date"></small>
+            </div>
+            <div class="info-text">
+                Upload your PDF resume once. It will be automatically attached to job application forms.
+            </div>
+            <button class="btn-secondary" id="clear-pdf-btn" style="margin-top: 8px; display: none;">Remove PDF</button>
+        </div>
+
+        <div class="divider"></div>
+
+        <!-- Job Titles Section -->
+        <div class="section">
+            <div class="section-title">
+                Target Job Titles
+                <span id="titles-status" class="status-badge unsaved">Unsaved</span>
+            </div>
+            <div class="form-group">
+                <label for="job-titles">Job Title Keywords (comma-separated)</label>
+                <input
+                    type="text"
+                    id="job-titles"
+                    placeholder="e.g., Software Engineer, Backend Developer, SDE"
+                />
+            </div>
+            <div class="info-text">
+                These help filter which job forms to assist with.
+            </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <!-- Preferences Section -->
+        <div class="section">
+            <div class="section-title">
+                Preferences & Requirements
+                <span id="preferences-status" class="status-badge unsaved">Unsaved</span>
+            </div>
+            <div class="form-group">
+                <label for="expected-salary">Expected Salary (Annual)</label>
+                <input
+                    type="text"
+                    id="expected-salary"
+                    placeholder="e.g., 120000 or 120000-150000"
+                />
+            </div>
+            <div class="form-group">
+                <label for="notice-period">Notice Period</label>
+                <input
+                    type="text"
+                    id="notice-period"
+                    placeholder="e.g., 2 weeks, 1 month, Immediate"
+                />
+            </div>
+            <div class="form-group">
+                <label for="visa-sponsorship">Visa/Sponsorship Status</label>
+                <input
+                    type="text"
+                    id="visa-sponsorship"
+                    placeholder="e.g., Requires sponsorship, Authorized to work, No sponsorship needed"
+                />
+            </div>
+            <div class="info-text">
+                These preferences will be auto-filled directly into application fields without requiring AI processing.
+            </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <!-- Action Buttons -->
+        <div style="margin-bottom: 16px;">
+            <button id="startAutofillBtn" style="width: 100%; padding: 12px; font-size: 14px; font-weight: 600; border: none; border-radius: 4px; background-color: #10b981; color: white; cursor: pointer; transition: all 0.2s; margin-bottom: 8px;">⚡ Start Autofill</button>
+            <div id="autofillProgress" style="display: none; padding: 10px; background-color: #f0f9ff; border-left: 3px solid #0066cc; border-radius: 4px; font-size: 12px;">
+                <div id="progressText" style="color: #0066cc; font-weight: 500; margin-bottom: 6px;">Reading fields...</div>
+                <div style="display: flex; gap: 4px;">
+                    <div id="progressDot1" style="width: 8px; height: 8px; background-color: #0066cc; border-radius: 50%;"></div>
+                    <div id="progressDot2" style="width: 8px; height: 8px; background-color: #ddd; border-radius: 50%;"></div>
+                    <div id="progressDot3" style="width: 8px; height: 8px; background-color: #ddd; border-radius: 50%;"></div>
+                    <div id="progressDot4" style="width: 8px; height: 8px; background-color: #ddd; border-radius: 50%;"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <!-- Buttons -->
+        <div class="button-group">
+            <button class="btn-primary" id="save-btn">💾 Save Settings</button>
+            <button class="btn-secondary" id="reset-btn">↺ Reset</button>
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            <p>v1.0.0 | Extension is active on job application sites</p>
+        </div>
+    </div>
+
+    <script src="popup.js"></script>
+</body>
+</html>

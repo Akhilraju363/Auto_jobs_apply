@@ -1,0 +1,90 @@
+============================================
+CHROME EXTENSION LOADING - SIMPLIFIED
+============================================
+
+The extension folder has been moved to a simpler location.
+This error should NOT happen again.
+
+============================================
+NEW EXTENSION LOCATION:
+============================================
+
+C:\Users\Madan A\OneDrive\Documents\Desktop\Auto_job_apply\extension
+
+(Much simpler - only 2 folder levels!)
+
+============================================
+QUICK START:
+============================================
+
+Option A - AUTOMATIC (Easiest):
+    1. Double-click: LOAD_EXTENSION.bat (in this folder)
+    2. Follow the instructions it displays
+
+Option B - MANUAL:
+    1. Open Chrome
+    2. Go to: chrome://extensions/
+    3. Toggle "Developer mode" ON (top right, turns blue)
+    4. Click "Load unpacked"
+    5. Navigate to Desktop → Auto_job_apply → extension folder
+    6. Click "Select Folder"
+
+============================================
+NAVIGATION GUIDE:
+============================================
+
+When Chrome's folder picker opens:
+
+Desktop
+  └── Auto_job_apply          ← Open this
+      └── extension           ← SELECT THIS FOLDER
+
+Inside the extension folder you should see:
+  ✓ manifest.json (MUST be here)
+  ✓ popup.html
+  ✓ content.js
+  ✓ background.js
+  ✓ gemini.js
+  ✓ popup.js
+
+If you see Python files (main.py, config.py, etc),
+you're in the WRONG folder!
+
+============================================
+COPY-PASTE METHOD (if manual):
+============================================
+
+In Chrome's folder picker address bar, paste:
+C:\Users\Madan A\OneDrive\Documents\Desktop\Auto_job_apply\extension
+
+Then press Enter and click "Select Folder"
+
+============================================
+WHAT HAPPENS NEXT:
+============================================
+
+If successful:
+  ✓ Extension appears in your extensions list
+  ✓ Icon appears in your Chrome toolbar
+  ✓ No error messages
+
+Click the extension icon to configure:
+  1. Add Gemini API key (from aistudio.google.com)
+  2. Paste your resume
+  3. Click "Save Settings"
+
+============================================
+IF IT STILL DOESN'T WORK:
+============================================
+
+1. Run: python main.py --mode test
+   (This verifies the extension folder path)
+
+2. Check the diagnostic output - it will show:
+   [+] Chrome Extension  [+] Ready. Load: ...
+   (The path shown is where Chrome should look)
+
+3. Make absolutely sure you're selecting the
+   folder that contains "manifest.json" directly
+
+============================================

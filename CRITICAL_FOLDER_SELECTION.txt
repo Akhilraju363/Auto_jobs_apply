@@ -1,0 +1,86 @@
+╔════════════════════════════════════════════════════════════════╗
+║         CRITICAL: FOLDER SELECTION ERROR - FIXED                ║
+╚════════════════════════════════════════════════════════════════╝
+
+YOU KEEP SELECTING THE WRONG FOLDER!
+
+WRONG ❌:
+  You're selecting: C:\Users\...\Desktop\Auto_job_apply\Auto_job_apply
+  This causes: "__pycache__ error"
+
+CORRECT ✅:
+  You should select: C:\Users\...\Desktop\Auto_job_apply
+  (The OUTER Auto_job_apply folder, not the inner one!)
+
+════════════════════════════════════════════════════════════════
+
+SIMPLE VISUAL:
+
+Desktop
+├── Auto_job_apply ← ← ← SELECT THIS ONE!
+    ├── extension
+    │   └── manifest.json
+    └── Auto_job_apply ← Don't select this one!
+        ├── main.py
+        └── config.py
+
+════════════════════════════════════════════════════════════════
+
+IN CHROME - STEP BY STEP:
+
+1. Type in address bar: chrome://extensions/
+
+2. Top right: Toggle "Developer mode" ON (turns blue)
+
+3. Click: "Load unpacked"
+
+4. In the folder picker window that opens:
+   - Click on "Desktop" to navigate there
+   - You'll see a folder named "Auto_job_apply"
+   - RIGHT-CLICK on "Auto_job_apply" → Properties
+     (to verify the extension folder is inside it)
+   - SINGLE-CLICK on "Auto_job_apply" to select it
+   - Click "Select Folder" button
+
+   ✓ Do NOT double-click Auto_job_apply
+   ✓ Do NOT open the "Auto_job_apply" folder
+   ✓ Just select it and click "Select Folder"
+
+════════════════════════════════════════════════════════════════
+
+PATH TO COPY (if folder picker has address bar):
+
+C:\Users\Madan A\OneDrive\Documents\Desktop\Auto_job_apply
+
+Then click "Select Folder"
+
+════════════════════════════════════════════════════════════════
+
+WHAT SHOULD HAPPEN:
+
+✓ Extension loads successfully
+✓ No error messages
+✓ Icon appears in Chrome toolbar
+✓ Extension shows in chrome://extensions/ list
+
+════════════════════════════════════════════════════════════════
+
+IF YOU STILL GET __pycache__ ERROR:
+
+It means you're selecting the INNER Auto_job_apply folder again.
+Go back and select the OUTER one (one level up).
+
+The outer folder contains:
+- extension/
+- Auto_job_apply/
+- LOAD_EXTENSION.bat
+- README files
+
+The inner folder contains:
+- main.py
+- config.py
+- Other Python files
+
+SELECT THE OUTER ONE!
+
+════════════════════════════════════════════════════════════════

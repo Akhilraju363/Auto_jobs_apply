@@ -1,0 +1,11 @@
+# Supported Python: 3.11+ (scikit-learn 1.9 requires >=3.11). Tested on Python 3.14.
+# playwright 1.48.0 (pins greenlet==3.1.1) and scikit-learn 1.5.1 have no Python 3.14
+# wheels, so they are pinned to the versions the Naukri scanner was validated with.
+# After installing, run: python -m playwright install chromium
+playwright==1.60.0
+google-genai==0.3.0
+scikit-learn==1.9.1
+python-dotenv==1.0.1
+flask==3.0.0
+# Phase 3.2: reads the AI Agent's verified resume PDF to validate it before a Naukri upload (pure Python)
+pypdf==6.19.0

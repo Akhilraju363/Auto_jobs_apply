@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "AI Job Application Autofiller",
+  "version": "1.0.0",
+  "description": "AI-powered autofilling for job application forms using Gemini",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://generativelanguage.googleapis.com/*"
+  ],
+  "action": {
+    "default_popup": "chrome_extension/popup.html",
+    "default_title": "AI Job Autofiller"
+  },
+  "background": {
+    "service_worker": "chrome_extension/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.workday.com/*",
+        "https://www.linkedin.com/*",
+        "https://www.naukri.com/*",
+        "https://*.greenhouse.io/*",
+        "https://*.lever.co/*"
+      ],
+      "js": [
+        "chrome_extension/gemini.js",
+        "chrome_extension/content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "chrome_extension/icons/icon-16.png",
+    "48": "chrome_extension/icons/icon-48.png",
+    "128": "chrome_extension/icons/icon-128.png"
+  }
+}

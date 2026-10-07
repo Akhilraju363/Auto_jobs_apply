@@ -1,0 +1,36 @@
+PROFESSIONAL RESUME
+
+NAME: Software Engineer
+EMAIL: your.email@example.com
+PHONE: +1-XXX-XXX-XXXX
+
+SUMMARY
+Skilled software engineer with experience in full-stack development, web applications, and automation tools.
+
+PROFESSIONAL EXPERIENCE
+
+Senior Software Engineer | Tech Company | 2022 - Present
+- Developed and maintained scalable web applications using Python and JavaScript
+- Led a team of 5 engineers in designing and implementing microservices architecture
+- Improved application performance by 40% through optimization and caching strategies
+- Implemented automated testing and CI/CD pipelines using GitHub Actions
+
+Software Developer | Previous Company | 2020 - 2022
+- Built RESTful APIs using Flask and FastAPI frameworks
+- Worked with relational databases (PostgreSQL, MySQL) and NoSQL databases (MongoDB)
+- Collaborated with cross-functional teams to deliver projects on time
+- Mentored junior developers and conducted code reviews
+
+SKILLS
+Languages: Python, JavaScript, HTML, CSS, SQL
+Frameworks: Flask, FastAPI, React, Django
+Databases: PostgreSQL, MySQL, MongoDB, SQLite
+Tools: Git, Docker, Linux, AWS, Playwright
+Specializations: Web Development, Backend Development, Automation
+
+EDUCATION
+Bachelor of Science in Computer Science | University Name | 2020
+
+CERTIFICATIONS
+- AWS Solutions Architect Associate (2022)
+- Python Professional Certificate (2021)

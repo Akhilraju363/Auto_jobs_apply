@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Job Application Automation Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50">
+    <div class="min-h-screen flex flex-col">
+        <!-- Header -->
+        <header class="bg-white border-b border-slate-200 sticky top-0 z-40">
+            <div class="max-w-6xl mx-auto px-6 py-4">
+                <h1 class="text-2xl font-bold text-slate-900">Job Application Automation</h1>
+                <p class="text-sm text-slate-500 mt-1">Real-time monitoring dashboard</p>
+            </div>
+        </header>
+
+        <!-- HITL Alert Modal -->
+        <div id="hitl-modal" class="hidden fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div class="bg-white rounded-lg shadow-xl max-w-md w-full mx-4">
+                <div class="bg-red-50 border-l-4 border-red-500 p-4">
+                    <h2 class="text-lg font-bold text-red-900">⚠️ Manual Intervention Required</h2>
+                </div>
+                <div class="p-6 space-y-4">
+                    <div id="hitl-job-details" class="space-y-2">
+                        <p class="text-sm text-slate-600">
+                            <span class="font-semibold">Job:</span>
+                            <span id="hitl-job-title" class="text-slate-900"></span>
+                        </p>
+                        <p class="text-sm text-slate-600">
+                            <span class="font-semibold">Company:</span>
+                            <span id="hitl-job-company" class="text-slate-900"></span>
+                        </p>
+                        <p class="text-sm text-slate-600">
+                            <span class="font-semibold">Reason:</span>
+                            <span id="hitl-job-reason" class="text-red-700 font-medium"></span>
+                        </p>
+                        <p class="text-xs text-slate-500 pt-2">
+                            <span id="hitl-job-url" class="text-blue-600 hover:underline cursor-pointer"></span>
+                        </p>
+                    </div>
+                    <div class="bg-blue-50 border border-blue-200 rounded p-3">
+                        <p class="text-sm text-blue-900">
+                            Please handle the CAPTCHA/OTP/manual action in your browser, then click resume.
+                        </p>
+                    </div>
+                    <button id="hitl-resume-btn" class="w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-2 px-4 rounded transition">
+                        ✓ Resume Automation
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <main class="flex-1 max-w-6xl w-full mx-auto px-6 py-8">
+            <!-- Metrics Bar -->
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                <!-- Daily Count Card -->
+                <div class="bg-white rounded-lg shadow border border-slate-200 p-6">
+                    <h3 class="text-sm font-semibold text-slate-600 uppercase tracking-wide">Daily Applications</h3>
+                    <div class="mt-4 flex items-baseline space-x-2">
+                        <span id="daily-count" class="text-4xl font-bold text-blue-600">0</span>
+                        <span class="text-slate-500">/</span>
+                        <span id="daily-limit" class="text-2xl font-semibold text-slate-600">25</span>
+                    </div>
+                    <div id="daily-progress" class="mt-4 w-full bg-slate-200 rounded-full h-2">
+                        <div class="bg-blue-600 h-2 rounded-full transition-all duration-300" style="width: 0%"></div>
+                    </div>
+                    <p class="text-xs text-slate-500 mt-2">Today's progress</p>
+                </div>
+
+                <!-- Status Card -->
+                <div class="bg-white rounded-lg shadow border border-slate-200 p-6">
+                    <h3 class="text-sm font-semibold text-slate-600 uppercase tracking-wide">Automation Status</h3>
+                    <div class="mt-4">
+                        <div id="status-badge" class="inline-block px-3 py-1 rounded-full text-sm font-medium bg-slate-100 text-slate-700">
+                            Idle
+                        </div>
+                        <p id="status-text" class="text-sm text-slate-600 mt-3">Ready to start</p>
+                    </div>
+                </div>
+
+                <!-- Control Card -->
+                <div class="bg-white rounded-lg shadow border border-slate-200 p-6">
+                    <h3 class="text-sm font-semibold text-slate-600 uppercase tracking-wide">Controls</h3>
+                    <button id="start-btn" class="mt-4 w-full bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white font-semibold py-2 px-4 rounded transition">
+                        ▶ Start Automation
+                    </button>
+                </div>
+            </div>
+
+            <!-- Application History Table -->
+            <div class="bg-white rounded-lg shadow border border-slate-200 overflow-hidden">
+                <div class="px-6 py-4 border-b border-slate-200">
+                    <h2 class="text-lg font-bold text-slate-900">Recent Applications</h2>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead class="bg-slate-50 border-b border-slate-200">
+                            <tr>
+                                <th class="px-6 py-3 text-left font-semibold text-slate-700">Title</th>
+                                <th class="px-6 py-3 text-left font-semibold text-slate-700">Company</th>
+                                <th class="px-6 py-3 text-left font-semibold text-slate-700">Platform</th>
+                                <th class="px-6 py-3 text-center font-semibold text-slate-700">Match %</th>
+                                <th class="px-6 py-3 text-left font-semibold text-slate-700">Status</th>
+                                <th class="px-6 py-3 text-left font-semibold text-slate-700">Timestamp</th>
+                            </tr>
+                        </thead>
+                        <tbody id="applications-table" class="divide-y divide-slate-200">
+                            <tr class="hover:bg-slate-50">
+                                <td colspan="6" class="px-6 py-8 text-center text-slate-500">
+                                    No applications yet
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        const API_POLL_INTERVAL = 2000; // 2 seconds
+        let pollingInterval;
+
+        async function fetchStatus() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+
+                if (!response.ok) {
+                    console.error('Status fetch error:', data);
+                    return;
+                }
+
+                updateUI(data);
+            } catch (error) {
+                console.error('Fetch error:', error);
+            }
+        }
+
+        function updateUI(data) {
+            // Update daily count
+            const dailyCount = data.daily_count || 0;
+            const dailyLimit = data.daily_limit || 25;
+            const percentage = Math.min(100, (dailyCount / dailyLimit) * 100);
+
+            document.getElementById('daily-count').textContent = dailyCount;
+            document.getElementById('daily-limit').textContent = dailyLimit;
+            document.querySelector('#daily-progress div').style.width = percentage + '%';
+
+            // Update automation status
+            const statusBadge = document.getElementById('status-badge');
+            const statusText = document.getElementById('status-text');
+            const startBtn = document.getElementById('start-btn');
+
+            if (data.automation_running) {
+                statusBadge.className = 'inline-block px-3 py-1 rounded-full text-sm font-medium bg-blue-100 text-blue-700';
+                statusBadge.textContent = '🔄 Running';
+                statusText.textContent = 'Automation in progress...';
+                startBtn.disabled = true;
+            } else if (data.is_paused) {
+                statusBadge.className = 'inline-block px-3 py-1 rounded-full text-sm font-medium bg-red-100 text-red-700';
+                statusBadge.textContent = '⏸️ Paused';
+                statusText.textContent = 'Awaiting manual intervention...';
+                startBtn.disabled = true;
+            } else {
+                statusBadge.className = 'inline-block px-3 py-1 rounded-full text-sm font-medium bg-slate-100 text-slate-700';
+                statusBadge.textContent = '✓ Idle';
+                statusText.textContent = 'Ready to start';
+                startBtn.disabled = false;
+            }
+
+            // Handle HITL modal
+            const hitlModal = document.getElementById('hitl-modal');
+            if (data.is_paused && data.paused_job) {
+                document.getElementById('hitl-job-title').textContent = data.paused_job.title || 'N/A';
+                document.getElementById('hitl-job-company').textContent = data.paused_job.company || 'N/A';
+                document.getElementById('hitl-job-reason').textContent = data.paused_job.reason || 'Manual intervention required';
+
+                const urlElem = document.getElementById('hitl-job-url');
+                if (data.paused_job.url) {
+                    urlElem.textContent = 'View Job';
+                    urlElem.onclick = () => window.open(data.paused_job.url, '_blank');
+                }
+
+                hitlModal.classList.remove('hidden');
+            } else {
+                hitlModal.classList.add('hidden');
+            }
+
+            // Update applications table
+            updateApplicationsTable(data.recent_applications || []);
+        }
+
+        function updateApplicationsTable(applications) {
+            const tbody = document.getElementById('applications-table');
+
+            if (applications.length === 0) {
+                tbody.innerHTML = '<tr class="hover:bg-slate-50"><td colspan="6" class="px-6 py-8 text-center text-slate-500">No applications yet</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = applications.map(app => `
+                <tr class="hover:bg-slate-50 transition">
+                    <td class="px-6 py-3 text-slate-900 font-medium">${escapeHtml(app.title || '')}</td>
+                    <td class="px-6 py-3 text-slate-600">${escapeHtml(app.company || '')}</td>
+                    <td class="px-6 py-3 text-slate-600">
+                        <span class="px-2 py-1 bg-slate-100 text-slate-700 rounded text-xs font-medium">
+                            ${escapeHtml(app.platform || '')}
+                        </span>
+                    </td>
+                    <td class="px-6 py-3 text-center">
+                        <span class="font-semibold ${getScoreColor(app.match_score)}">
+                            ${(app.match_score || 0).toFixed(1)}%
+                        </span>
+                    </td>
+                    <td class="px-6 py-3">
+                        <span class="px-2 py-1 rounded text-xs font-medium ${getStatusColor(app.status)}">
+                            ${escapeHtml(app.status || 'pending')}
+                        </span>
+                    </td>
+                    <td class="px-6 py-3 text-slate-500 text-xs">
+                        ${formatTime(app.applied_at)}
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        function getScoreColor(score) {
+            if (score >= 70) return 'text-green-600';
+            if (score >= 40) return 'text-yellow-600';
+            return 'text-red-600';
+        }
+
+        function getStatusColor(status) {
+            const statusMap = {
+                'applied': 'bg-green-100 text-green-700',
+                'EXTERNAL_PENDING': 'bg-yellow-100 text-yellow-700',
+                'pending': 'bg-slate-100 text-slate-700',
+            };
+            return statusMap[status] || 'bg-slate-100 text-slate-700';
+        }
+
+        function formatTime(isoString) {
+            if (!isoString) return '-';
+            try {
+                const date = new Date(isoString);
+                return date.toLocaleString('en-US', {
+                    month: 'short',
+                    day: 'numeric',
+                    hour: '2-digit',
+                    minute: '2-digit'
+                });
+            } catch {
+                return isoString;
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Event listeners
+        document.getElementById('start-btn').addEventListener('click', async () => {
+            const btn = document.getElementById('start-btn');
+            btn.disabled = true;
+            btn.textContent = '⏳ Starting...';
+
+            try {
+                const response = await fetch('/api/start', { method: 'POST' });
+                const data = await response.json();
+
+                if (response.ok) {
+                    console.log('Automation started');
+                } else {
+                    console.error('Error:', data);
+                    alert('Error: ' + (data.error || 'Failed to start automation'));
+                }
+            } catch (error) {
+                console.error('Error starting automation:', error);
+                alert('Error: Could not start automation');
+            }
+        });
+
+        document.getElementById('hitl-resume-btn').addEventListener('click', async () => {
+            const btn = document.getElementById('hitl-resume-btn');
+            btn.disabled = true;
+            btn.textContent = '⏳ Resuming...';
+
+            try {
+                const response = await fetch('/api/resume', { method: 'POST' });
+                const data = await response.json();
+
+                if (response.ok) {
+                    console.log('Automation resumed');
+                    document.getElementById('hitl-modal').classList.add('hidden');
+                    fetchStatus();
+                } else {
+                    console.error('Error:', data);
+                    alert('Error: ' + (data.error || 'Failed to resume'));
+                }
+            } catch (error) {
+                console.error('Error resuming automation:', error);
+                alert('Error: Could not resume automation');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '✓ Resume Automation';
+            }
+        });
+
+        // Initial status fetch and polling
+        fetchStatus();
+        pollingInterval = setInterval(fetchStatus, API_POLL_INTERVAL);
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            clearInterval(pollingInterval);
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,65 @@
+============================================
+CHROME EXTENSION LOADING - EXACT STEPS
+============================================
+
+⚠️ CRITICAL: You must select the 'extension' FOLDER, not the parent folder!
+
+============================================
+COPY THIS PATH EXACTLY:
+============================================
+
+C:\Users\Madan A\OneDrive\Documents\Desktop\Auto_job_apply\Auto_job_apply\extension
+
+============================================
+STEP-BY-STEP INSTRUCTIONS:
+============================================
+
+1. Open Chrome and type in address bar:
+   chrome://extensions/
+
+2. In top-right corner, toggle "Developer mode" ON (turns blue)
+
+3. Click the "Load unpacked" button
+
+4. A folder picker dialog opens. In the dialog:
+   - Click the address/path bar at the top
+   - Paste this path:
+     C:\Users\Madan A\OneDrive\Documents\Desktop\Auto_job_apply\Auto_job_apply\extension
+   - Press Enter
+
+5. OR if you prefer to browse:
+   - Navigate to: C:\Users\Madan A\OneDrive\Documents\Desktop\
+   - Open: Auto_job_apply folder
+   - Open: Auto_job_apply folder (second one with same name)
+   - Open: extension folder ← STOP HERE
+   - You should see "manifest.json" file DIRECTLY in this folder
+   - Click "Select Folder" button
+
+============================================
+WHAT YOU SHOULD SEE:
+============================================
+
+When you're in the RIGHT folder, these files should be DIRECTLY visible:
+✓ manifest.json
+✓ popup.html
+✓ content.js
+✓ background.js
+✓ gemini.js
+✓ popup.js
+
+If you see Python files (main.py, config.py, etc.), you're in the WRONG folder!
+Go back up and find the 'extension' subfolder.
+
+============================================
+COMMON MISTAKE:
+============================================
+
+❌ WRONG - Don't select this:
+C:\Users\Madan A\OneDrive\Documents\Desktop\Auto_job_apply\Auto_job_apply
+
+✅ CORRECT - Select this:
+C:\Users\Madan A\OneDrive\Documents\Desktop\Auto_job_apply\Auto_job_apply\extension
+                                                                        ^^^^^^^^^^
+                                                                        Add this!
+
+============================================
