@@ -15,7 +15,11 @@ def resolve_project_path(value: str) -> Path:
 
 # Single resume source for matching (plain text). Override with RESUME_PATH in .env.
 RESUME_PATH = resolve_project_path(os.getenv("RESUME_PATH", "").strip() or "resume.txt")
-DB_PATH = BASE_DIR / "jobs.db"
+# Phase 4: the one local SQLite database (operational source of truth for application history).
+# jobs.db is the pre-Phase-4 location; db.init_db() copies it here once and leaves it untouched.
+DEFAULT_DB_PATH = BASE_DIR / "data" / "naukri_auto_apply.db"
+LEGACY_DB_PATH = BASE_DIR / "jobs.db"
+DB_PATH = resolve_project_path(os.getenv("NAUKRI_DB_PATH", "").strip() or str(DEFAULT_DB_PATH))
 CHROME_USER_DATA = BASE_DIR / "chrome_user_data"
 
 MATCH_THRESHOLD = 10.0
@@ -107,9 +111,32 @@ CONFIRMATION_WAIT_SECONDS = max(0, _env_number("CONFIRMATION_WAIT_SECONDS", 20))
 APPLICATION_DEBUG = _env_bool("APPLICATION_DEBUG", True)  # sanitized failure diagnostics (no page text, no answers)
 APPLICATION_DEBUG_DIR = resolve_project_path(os.getenv("APPLICATION_DEBUG_DIR", "").strip() or "output/application_debug")
 
+# Phase 4 local orchestrator (application_pipeline.py / start_local.bat).
+# APPLICATION_MODE: SAFE (default; every submission needs your 'y') or AUTO. Read raw here and
+# validated by application_pipeline.validate_configuration(): an unknown value is an error, never AUTO.
+APPLICATION_MODE = (os.getenv("APPLICATION_MODE", "").strip() or "SAFE").upper()
+# The AI Agent checkout. Default: the folder that contains AI_AGENT_OUTPUT_DIR.
+_ai_agent_dir = os.getenv("AI_AGENT_DIR", "").strip()
+AI_AGENT_DIR = (
+    resolve_project_path(_ai_agent_dir) if _ai_agent_dir else (AI_AGENT_OUTPUT_DIR.parent if AI_AGENT_OUTPUT_DIR else None)
+)
+# The AI Agent's own interpreter. Default: <AI_AGENT_DIR>/.venv/Scripts/python.exe (or bin/python).
+_ai_agent_python = os.getenv("AI_AGENT_PYTHON", "").strip()
+AI_AGENT_PYTHON = resolve_project_path(_ai_agent_python) if _ai_agent_python else None
+# The AI Agent stage scripts the pipeline runs, in order (scripts/<name> inside AI_AGENT_DIR).
+AI_AGENT_STAGES = _env_list("AI_AGENT_STAGES", ["scrape_jobs.py", "score_jobs.py", "tailor_job.py"])
+AI_AGENT_TIMEOUT_MINUTES = max(1, _env_number("AI_AGENT_TIMEOUT_MINUTES", 60))
+# Google Sheets tracking through the AI Agent's tracker sheet and its `gws` CLI login.
+GOOGLE_SHEETS_ENABLED = _env_bool("GOOGLE_SHEETS_ENABLED", True)
+# Empty: reuse google_sheet_id from the AI Agent's .env (only that key is read).
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
+GOOGLE_SHEET_TAB = os.getenv("GOOGLE_SHEET_TAB", "").strip() or "Sheet1"
+
 __all__ = [
     "BASE_DIR",
     "RESUME_PATH",
+    "DEFAULT_DB_PATH",
+    "LEGACY_DB_PATH",
     "DB_PATH",
     "CHROME_USER_DATA",
     "MATCH_THRESHOLD",
@@ -138,4 +165,12 @@ __all__ = [
     "CONFIRMATION_WAIT_SECONDS",
     "APPLICATION_DEBUG",
     "APPLICATION_DEBUG_DIR",
+    "APPLICATION_MODE",
+    "AI_AGENT_DIR",
+    "AI_AGENT_PYTHON",
+    "AI_AGENT_STAGES",
+    "AI_AGENT_TIMEOUT_MINUTES",
+    "GOOGLE_SHEETS_ENABLED",
+    "GOOGLE_SHEET_ID",
+    "GOOGLE_SHEET_TAB",
 ]

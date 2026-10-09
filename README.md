@@ -228,7 +228,8 @@ The extension is useful for:
 
 - `.env` contains local secrets and API settings
 - `resume.txt` contains the resume text used for matching and autofill
-- `jobs.db` stores application tracking data
+- `data/naukri_auto_apply.db` (SQLite) stores jobs, scores and application history; the pre-Phase-4
+  `jobs.db` is copied there once on first run and then left untouched as a backup
 - `chrome_user_data/` keeps browser profile state for persistent Chromium sessions
 
 ## Notes on usage
@@ -315,3 +316,26 @@ artifact. Candidate priority is display-only. Previous applications are
 reference data, not a source of unsupported claims; the master resume remains
 the factual source of truth. `--action fresh-jobs` is read-only, and
 `--dry-run` never clicks Apply, uploads, answers questions, or submits.
+
+## Phase 4: one-command local pipeline
+
+```bat
+C:\Users\akhil\Auto_job_apply\start_local.bat
+```
+
+runs the whole workflow: verify configuration and the Naukri session → scan → keep jobs posted within
+24 hours → drop already-applied jobs → AI Agent scoring → eligibility → verified resume → prepare and
+apply (SAFE: only after your exact `y`/`yes`) → verify → SQLite → Google Sheets → summary.
+
+- **SQLite** (`data/naukri_auto_apply.db`) is the source of truth. **Successfully applied job = never
+  automatically resubmitted. Same company ≠ same job**: history matches the canonical job URL, Naukri
+  job ID or dedup key, never the company.
+- **Google Sheets** reuses the AI Agent's tracker sheet and `gws` login. A Sheets failure leaves the
+  row pending for the next run and never causes a reapplication.
+- **`APPLICATION_MODE=SAFE`** is the default. `AUTO` is refused until one SAFE-mode application has
+  been confirmed.
+- Useful flags: `--dry-run`, `--no-apply`, `--skip-scan`, `--skip-agent`, `--sync-only`;
+  `python application_pipeline.py --check-config` validates the setup.
+
+Architecture, configuration, the 24-hour rule, recovery and troubleshooting:
+[docs/PIPELINE.md](docs/PIPELINE.md).

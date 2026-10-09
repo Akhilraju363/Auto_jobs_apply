@@ -36,6 +36,7 @@ from db import (
     get_job,
     get_jobs,
     get_jobs_by_application_state,
+    queue_sheet_sync,
     set_application_state,
 )
 from naukri_application import (
@@ -590,6 +591,7 @@ def run_recover_application(job_row_id: int) -> int:
     except ApplicationStop as e:
         print(f"\nSTOPPED ({e.code}): {e}\nThe job stays in recovery.")
         return 1
+    queue_sheet_sync(job_row_id)  # Phase 4: report the settled outcome to the Google Sheet
     print(f"\nResult: {result.state.upper()}" + (f" ({result.code})" if result.code else ""))
     print(f"Reason: {result.reason}")
     if result.state == "ready":
@@ -638,16 +640,20 @@ def run_apply(job_row_id: Optional[int], dry_run: bool, max_jobs: Optional[int],
                 results.append(runner.process(job))
             except ApplicationStop as e:
                 print(f"\nSTOPPED ({e.code}): {e}")
+                if not dry_run:
+                    queue_sheet_sync(job["id"])
                 break
             result = results[-1]
+            if not dry_run:
+                queue_sheet_sync(job["id"])  # Phase 4: SQLite holds the outcome; this queues tracking only
             print(f"-> [{job['id']}] {result.state}" + (f" ({result.code})" if result.code else "")
                   + (f": {result.reason}" if result.reason else ""))
             if result.external_url:
                 print(f"   Apply manually at: {result.external_url}")
     submitted = sum(1 for r in results if r.submitted)
     print(f"\nProcessed: {len(results)} | Submitted: {submitted}" + (" | DRY RUN: nothing clicked or recorded" if dry_run else ""))
-    if submitted:
-        print("Tracker: set the AI Agent's Google Sheet status to Applied for these jobs (not automated yet).")
+    if results and not dry_run:
+        print("Tracker: outcomes queued for Google Sheets; sync now with  python application_pipeline.py --sync-only")
     return 0
 
 

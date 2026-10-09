@@ -351,10 +351,11 @@ up as `already_applied` without an `applied_jobs` row.
 
 ## Google Sheet
 
-Application state is authoritative in `jobs.db`. The AI Agent's tracker row (Source = Naukri,
-Status = Not Applied) is **not** updated automatically yet. The integration point is the AI
-Agent's `tracker_service.set_status(link, "Applied")` / `write_sheet.set_status`. After a
-successful submission, `apply` reminds you to set the Sheet status.
+Application state is authoritative in SQLite (`data/naukri_auto_apply.db` since Phase 4). Since
+Phase 4, `apply` and `recover-application` queue each outcome in the `sheet_sync` table and the
+pipeline writes it to the AI Agent's tracker sheet (updating the Agent's own row for the job, Status
+`Applied` once confirmed). Sync now with `python application_pipeline.py --sync-only`. A Sheets
+failure only leaves the row pending. Details: [PIPELINE.md](PIPELINE.md#google-sheets).
 
 ## Troubleshooting
 

@@ -122,7 +122,44 @@ def decide_idempotency(job: dict, successful: bool, record: Optional[dict], open
     return IdempotencyDecision(True, close_open_attempts=not_clicked)
 
 
+# Phase 4 reporting labels. A read-only view over db.APPLICATION_STATES (+ the NOT_APPROVED code) for
+# the run summary and the Google Sheet -- not a second state system; nothing is ever stored as a label.
+OUTCOME_NOT_APPROVED = "NOT_APPROVED"
+OUTCOME_READY = "READY"
+OUTCOME_APPLYING = "APPLYING"
+OUTCOME_APPLIED = "APPLIED"
+OUTCOME_FAILED = "FAILED"
+OUTCOME_RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+OUTCOME_SKIPPED = "SKIPPED"
+OUTCOME_NOT_PREPARED = "NOT_PREPARED"
+
+
+def application_outcome_label(state: Optional[str], code: Optional[str] = None) -> str:
+    if state in ("applied", "already_applied"):
+        return OUTCOME_APPLIED
+    if state == "recovery_required":
+        return OUTCOME_RECOVERY_REQUIRED
+    if state == "ready":
+        return OUTCOME_NOT_APPROVED if code == "NOT_APPROVED" else OUTCOME_READY
+    if state in ("preparing", "review_required", "approved", "submitting"):
+        return OUTCOME_APPLYING
+    if state in ("external_application", "job_unavailable"):
+        return OUTCOME_SKIPPED
+    if state in ("failed", "requires_login", "requires_manual_action", "not_ready"):
+        return OUTCOME_FAILED
+    return OUTCOME_NOT_PREPARED
+
+
 __all__ = [
+    "application_outcome_label",
+    "OUTCOME_NOT_APPROVED",
+    "OUTCOME_READY",
+    "OUTCOME_APPLYING",
+    "OUTCOME_APPLIED",
+    "OUTCOME_FAILED",
+    "OUTCOME_RECOVERY_REQUIRED",
+    "OUTCOME_SKIPPED",
+    "OUTCOME_NOT_PREPARED",
     "CONFIRMED_DURING_RECOVERY",
     "ConfirmationResult",
     "INTERRUPTED_AFTER_APPLY",
