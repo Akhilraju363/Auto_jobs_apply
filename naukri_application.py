@@ -820,6 +820,14 @@ class NaukriApplicationBrowser:
             raise RuntimeError(f"expected exactly one submit button in the application form, found {submit.count()}")
         submit.first.click()
 
+    def session_state(self) -> str:
+        """Phase 4: read-only login check on the saved profile ('authenticated', 'login_required' or
+        'unknown'). Opens Naukri's homepage; never types, clicks or submits anything."""
+        self.start()
+        self.page.goto("https://www.naukri.com/mnjuser/homepage", wait_until="domcontentloaded", timeout=self.timeout_ms)
+        self.page.wait_for_timeout(2500)  # the header renders after the main content
+        return classify_auth(self.snapshot())
+
     def wait_for_login(self, minutes: int, out: Callable[[str], None] = print) -> bool:
         """Open Naukri's login page and wait while the user logs in by hand. Never types anything."""
         self.start()

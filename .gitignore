@@ -13,7 +13,9 @@ __pycache__/
 exports/
 
 # Local database (job data + application history)
+data/
 jobs.db
+*.db.migrating
 *.db
 *.sqlite
 *.sqlite3

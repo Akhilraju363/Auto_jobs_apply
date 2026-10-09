@@ -11,14 +11,17 @@ import json
 import logging
 import os
 import re
+import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlsplit, urlunsplit
 
-from config import AI_AGENT_EXPORT_LIMIT, AI_AGENT_OUTPUT_DIR, NAUKRI_EXPORT_PATH
+from dotenv import dotenv_values
+
+from config import AI_AGENT_EXPORT_LIMIT, AI_AGENT_OUTPUT_DIR, BASE_DIR, NAUKRI_EXPORT_PATH
 from db import JOB_STATUS_DISCOVERED, get_jobs, init_db, save_job_score
 
 logger = logging.getLogger(__name__)
@@ -120,18 +123,29 @@ class ExportResult:
     supplemented: int = 0
     skipped: list[tuple[str, str]] = field(default_factory=list)  # (job reference, reason)
     exported: list[dict] = field(default_factory=list)
+    filtered_out: int = 0  # rejected by export_discovered_jobs(job_filter=...)
 
 
-def export_discovered_jobs(path: Optional[Path] = None, limit: Optional[int] = None) -> ExportResult:
+def export_discovered_jobs(
+    path: Optional[Path] = None,
+    limit: Optional[int] = None,
+    job_filter: Optional[Callable[[dict], bool]] = None,
+) -> ExportResult:
     """Write up to `limit` eligible discovered jobs (oldest first) for the AI Agent to ingest.
 
     Only status='discovered' jobs are selected, so scored jobs are never resent. The file is
     rewritten each time with the current pending jobs; jobs.db is not modified.
+    job_filter (Phase 4 pipeline): only jobs it accepts are exported, e.g. fresh, never-applied jobs,
+    so stale jobs never spend the small per-run AI Agent budget.
     """
     init_db()
     result = ExportResult(path=Path(path or NAUKRI_EXPORT_PATH), limit=limit or AI_AGENT_EXPORT_LIMIT)
     jobs = sorted(get_jobs(status=JOB_STATUS_DISCOVERED), key=lambda j: j["id"])
     result.discovered = len(jobs)
+    if job_filter is not None:
+        kept = [job for job in jobs if job_filter(job)]
+        result.filtered_out = len(jobs) - len(kept)
+        jobs = kept
     eligible = []
     for job in jobs:
         record, note = to_agent_record(job)
@@ -271,7 +285,103 @@ def import_agent_scores(scored_path: Optional[Path] = None) -> ImportResult:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Running the AI Agent (Phase 4 pipeline)
+# ---------------------------------------------------------------------------
+
+AGENT_NOT_CONFIGURED = "AGENT_NOT_CONFIGURED"
+AGENT_NOT_FOUND = "AGENT_NOT_FOUND"
+AGENT_STAGE_FAILED = "AGENT_STAGE_FAILED"
+AGENT_TIMEOUT = "AGENT_TIMEOUT"
+
+
+@dataclass
+class AgentRunResult:
+    ok: bool
+    stages_run: list[str] = field(default_factory=list)
+    failed_stage: Optional[str] = None
+    code: Optional[str] = None
+    message: str = ""
+
+
+def resolve_agent_python(agent_dir: Optional[Path], configured: Optional[Path] = None) -> Optional[Path]:
+    """The AI Agent's own interpreter: AI_AGENT_PYTHON, else its .venv. None when neither exists."""
+    if configured:
+        return Path(configured) if Path(configured).exists() else None
+    if agent_dir is None:
+        return None
+    for candidate in (Path(agent_dir) / ".venv" / "Scripts" / "python.exe", Path(agent_dir) / ".venv" / "bin" / "python"):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def agent_environment(export_path: Path, base_env: Optional[dict] = None,
+                      own_env_file: Path = BASE_DIR / ".env") -> dict:
+    """Environment for the AI Agent's scripts.
+
+    Every key that came from this project's .env is removed first: the Agent loads its own .env
+    with python-dotenv, which never overrides existing variables, so ours (e.g. GEMINI_API_KEY)
+    would otherwise silently replace the Agent's. Then the Naukri handoff is pointed at our export
+    and JOB_SOURCES is limited to naukri, so this pipeline never triggers a paid LinkedIn scrape.
+    """
+    env = dict(os.environ if base_env is None else base_env)
+    own = dotenv_values(own_env_file) if Path(own_env_file).exists() else {}
+    for name in own:
+        env.pop(name, None)
+    env["NAUKRI_JOBS_PATH"] = str(Path(export_path).resolve())
+    env["JOB_SOURCES"] = "naukri"
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    return env
+
+
+def run_agent_stages(
+    agent_dir: Optional[Path],
+    stages: list[str],
+    export_path: Optional[Path] = None,
+    python: Optional[Path] = None,
+    timeout_minutes: int = 60,
+    runner: Callable[..., Any] = subprocess.run,
+) -> AgentRunResult:
+    """Run the AI Agent's own stage scripts (scripts/<stage>) in its folder, in order, stopping at
+    the first failure. This is the same file handoff as before -- the Agent reads NAUKRI_JOBS_PATH
+    and writes output/scored_jobs.json -- just started by the pipeline instead of by hand."""
+    if agent_dir is None:
+        return AgentRunResult(False, code=AGENT_NOT_CONFIGURED,
+                              message="AI_AGENT_DIR / AI_AGENT_OUTPUT_DIR is not set in .env")
+    agent_dir = Path(agent_dir)
+    interpreter = python or resolve_agent_python(agent_dir)
+    if interpreter is None or not Path(interpreter).exists():
+        return AgentRunResult(False, code=AGENT_NOT_FOUND,
+                              message=f"AI Agent Python not found (expected {agent_dir / '.venv'}; set AI_AGENT_PYTHON)")
+    env = agent_environment(Path(export_path or NAUKRI_EXPORT_PATH))
+    result = AgentRunResult(True)
+    for stage in stages:
+        script = agent_dir / "scripts" / stage
+        if not script.exists():
+            return AgentRunResult(False, result.stages_run, stage, AGENT_NOT_FOUND, f"AI Agent script not found: {script}")
+        logger.info(f"AI Agent stage started: {stage}")
+        try:
+            completed = runner([str(interpreter), str(script)], cwd=str(agent_dir), env=env,
+                               timeout=timeout_minutes * 60, check=False)
+        except subprocess.TimeoutExpired:
+            return AgentRunResult(False, result.stages_run, stage, AGENT_TIMEOUT,
+                                  f"{stage} did not finish within {timeout_minutes} minutes")
+        except OSError as e:
+            return AgentRunResult(False, result.stages_run, stage, AGENT_NOT_FOUND, f"could not start {stage}: {e}")
+        if completed.returncode != 0:
+            return AgentRunResult(False, result.stages_run, stage, AGENT_STAGE_FAILED,
+                                  f"{stage} exited with code {completed.returncode}")
+        result.stages_run.append(stage)
+        logger.info(f"AI Agent stage finished: {stage}")
+    return result
+
+
 __all__ = [
+    "AgentRunResult",
+    "agent_environment",
+    "resolve_agent_python",
+    "run_agent_stages",
     "ExportResult",
     "ImportResult",
     "agent_canonical_link",

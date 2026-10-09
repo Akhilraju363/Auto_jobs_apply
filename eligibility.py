@@ -70,6 +70,35 @@ def freshness_for(
     return UNKNOWN, None
 
 
+def _scraped_time(value: Any) -> Optional[datetime]:
+    """When the label was read. The scanner stores scraped_at as naive local time."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    return value if _aware(value) else value.astimezone()
+
+
+def job_freshness(job: dict, *, reference_time: Optional[datetime], window_hours: int = 24
+                  ) -> tuple[str, Optional[float]]:
+    """Freshness of a stored job. Exact posted/updated timestamps win. A relative label ("5 hours
+    ago") describes the moment it was read, so it is aged by the time since scraped_at: a job read
+    as "Today" three days ago is STALE now. Ambiguous labels ("1 day ago") stay UNKNOWN."""
+    posted_at, updated_at = job.get("posted_at"), job.get("updated_at")
+    reference, scraped = _aware(reference_time), _scraped_time(job.get("scraped_at"))
+    if _parse_aware(posted_at) or _parse_aware(updated_at) or reference is None or scraped is None:
+        return freshness_for(job.get("posted_label"), reference_time=reference_time, posted_at=posted_at,
+                             updated_at=updated_at, window_hours=window_hours)
+    status, age = freshness_for(job.get("posted_label"), reference_time=scraped, window_hours=window_hours)
+    if status == UNKNOWN or age is None:
+        return UNKNOWN, None
+    age += max(0.0, (reference - scraped).total_seconds() / 3600)
+    return (FRESH if age < window_hours else STALE), age
+
+
 def normalize_preferred_location(value: Any) -> str:
     value = re.sub(r"[\s\W_]+", " ", str(value or "").strip().lower()).strip()
     return _ALIASES.get(value, value)
@@ -127,11 +156,7 @@ def evaluate_job(
     score_threshold: float = 8,
     window_hours: int = 24,
 ) -> Eligibility:
-    freshness, _ = freshness_for(
-        job.get("posted_label"), reference_time=reference_time,
-        posted_at=job.get("posted_at"), updated_at=job.get("updated_at"),
-        window_hours=window_hours,
-    )
+    freshness, _ = job_freshness(job, reference_time=reference_time, window_hours=window_hours)
     loc = job.get("location_match")
     loc = bool(loc) if loc is not None else location_match(job.get("location"), preferred_locations)
     exp = job.get("experience_match")
@@ -169,7 +194,7 @@ def priority_score(job: dict, result: Eligibility) -> int:
 
 
 __all__ = [
-    "FRESH", "STALE", "UNKNOWN", "Eligibility", "freshness_for",
+    "FRESH", "STALE", "UNKNOWN", "Eligibility", "freshness_for", "job_freshness",
     "normalize_preferred_location", "location_match", "experience_match",
     "evaluate_job", "priority_score",
 ]

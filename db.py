@@ -1,9 +1,12 @@
 import json
+import os
 import sqlite3
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from config import DB_PATH
+from urllib.parse import urlsplit, urlunsplit
+from config import DB_PATH, DEFAULT_DB_PATH, LEGACY_DB_PATH
 
 # Discovered jobs (Phase 1). Kept separate from applied_jobs so discovery never
 # counts toward the daily application limit or marks a job as applied.
@@ -101,7 +104,27 @@ APPLIED_STATUS = "applied"
 NOT_APPLIED_STATUS = "not_applied"
 
 
+def _migrate_legacy_db() -> None:
+    """Phase 4: copy the pre-Phase-4 jobs.db to the default data/ location once.
+
+    Only when the default location is in use and does not exist yet. The copy goes through
+    SQLite's backup API into a temporary file that is renamed into place, so an interrupted
+    copy never leaves a half-written database. jobs.db itself is never modified or deleted.
+    """
+    target = Path(DB_PATH)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() or not Path(LEGACY_DB_PATH).exists() \
+            or target.resolve() != Path(DEFAULT_DB_PATH).resolve():
+        return
+    tmp = target.with_name(target.name + ".migrating")
+    tmp.unlink(missing_ok=True)
+    with closing(sqlite3.connect(LEGACY_DB_PATH)) as source, closing(sqlite3.connect(tmp)) as copy:
+        source.backup(copy)
+    os.replace(tmp, target)
+
+
 def init_db() -> None:
+    _migrate_legacy_db()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -123,6 +146,7 @@ def init_db() -> None:
                 conn.execute(f"ALTER TABLE applied_jobs ADD COLUMN {name} {declaration}")
         _init_jobs_table(conn)
         _init_attempts_table(conn)
+        _init_sheet_sync_table(conn)
         conn.commit()
 
 
@@ -186,6 +210,31 @@ def _init_attempts_table(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_attempts_job ON application_attempts(job_row_id)")
+
+
+def _init_sheet_sync_table(conn: sqlite3.Connection) -> None:
+    """Phase 4 Google Sheets outbox: one row per job whose application outcome must reach the tracker.
+
+    Kept apart from applied_jobs/jobs on purpose: a Sheets failure only leaves this row PENDING and
+    can never change application history (SQLite stays the source of truth for duplicate prevention).
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sheet_sync (
+            job_row_id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL,
+            application_state TEXT,
+            application_code TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error_code TEXT,
+            last_error TEXT,
+            queued_at TIMESTAMP NOT NULL,
+            last_attempt_at TIMESTAMP,
+            synced_at TIMESTAMP
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sheet_sync_status ON sheet_sync(status)")
 
 
 def _find_job_row_id(
@@ -335,12 +384,58 @@ def _application_key(job: dict) -> str:
     return str(job.get("job_id") or f"jobrow:{job['id']}")
 
 
-def has_successful_application(job: dict) -> bool:
+def canonical_job_url(url: Optional[str]) -> Optional[str]:
+    """Job identity URL: https, lower-case host, no query/fragment/trailing slash (Naukri's job id
+    lives in the path). Same rule as naukri_parser.normalize_job_url for absolute URLs."""
+    if not url or not str(url).strip():
+        return None
+    parts = urlsplit(str(url).strip())
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None
+    return urlunsplit(("https", parts.netloc.lower(), parts.path.rstrip("/") or "/", "", ""))
+
+
+def find_successful_application(job: dict) -> Optional[dict]:
+    """The confirmed applied_jobs row for this exact job, or None.
+
+    Identity, strongest first: the legacy applied_jobs key, the canonical job URL, the Naukri job id,
+    then the jobs row dedup_key. Company or title are never used: the same company posting a
+    different job is a different job and stays eligible.
+    """
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM applied_jobs WHERE id = ? AND status = ?", (_application_key(job), APPLIED_STATUS)
-        ).fetchone()
-    return row is not None
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(
+            """
+            SELECT a.*, j.dedup_key AS job_dedup_key, j.job_id AS job_naukri_id, j.url AS job_url
+            FROM applied_jobs a LEFT JOIN jobs j ON j.id = a.job_row_id
+            WHERE a.status = ?
+            ORDER BY a.applied_at
+            """,
+            (APPLIED_STATUS,),
+        )]
+    key = _application_key(job) if job.get("id") is not None or job.get("job_id") else None
+    url = canonical_job_url(job.get("url"))
+    job_id = str(job.get("job_id") or "").strip() or None
+    dedup_key = job.get("dedup_key")
+    for matches in (
+        lambda r: key is not None and r["id"] == key,
+        lambda r: url is not None and url in {canonical_job_url(r.get(n)) for n in ("url", "application_url", "job_url")},
+        lambda r: job_id is not None and job_id in (r["id"], r.get("job_naukri_id")),
+        lambda r: bool(dedup_key) and r.get("job_dedup_key") == dedup_key,
+    ):
+        found = next((r for r in rows if matches(r)), None)
+        if found:
+            return found
+    return None
+
+
+def has_successful_application(job: dict) -> bool:
+    return find_successful_application(job) is not None
+
+
+def count_successful_applications() -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        return conn.execute("SELECT COUNT(*) FROM applied_jobs WHERE status = ?", (APPLIED_STATUS,)).fetchone()[0]
 
 
 def get_application_candidates(
@@ -564,6 +659,79 @@ def get_applied_jobs_count(date: Optional[str] = None) -> int:
         return cursor.fetchone()[0]
 
 
+# -- Phase 4 Google Sheets outbox ---------------------------------------------------------------
+SHEET_SYNC_PENDING = "PENDING"
+SHEET_SYNC_SYNCED = "SYNCED"
+
+
+def queue_sheet_sync(job_row_id: int) -> bool:
+    """Queue the job's current application outcome for the tracker. Returns False (no change) when
+    exactly that outcome was already synced, or the job does not exist."""
+    now = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(DB_PATH) as conn:
+        job = conn.execute("SELECT application_state, application_code FROM jobs WHERE id = ?",
+                           (job_row_id,)).fetchone()
+        if job is None:
+            return False
+        row = conn.execute("SELECT status, application_state, application_code FROM sheet_sync WHERE job_row_id = ?",
+                           (job_row_id,)).fetchone()
+        if row and row[0] == SHEET_SYNC_SYNCED and (row[1], row[2]) == tuple(job):
+            return False
+        conn.execute(
+            """
+            INSERT INTO sheet_sync (job_row_id, status, application_state, application_code, queued_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(job_row_id) DO UPDATE SET status = excluded.status,
+                application_state = excluded.application_state, application_code = excluded.application_code,
+                queued_at = excluded.queued_at, synced_at = NULL
+            """,
+            (job_row_id, SHEET_SYNC_PENDING, job[0], job[1], now),
+        )
+        conn.commit()
+        return True
+
+
+def get_sheet_syncs(status: Optional[str] = SHEET_SYNC_PENDING) -> list[dict]:
+    query, params = "SELECT * FROM sheet_sync", ()
+    if status:
+        query, params = query + " WHERE status = ?", (status,)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        return [dict(r) for r in conn.execute(query + " ORDER BY queued_at, job_row_id", params)]
+
+
+def mark_sheet_synced(job_row_id: int, application_state: Optional[str], application_code: Optional[str]) -> bool:
+    """Mark synced only if the queued outcome is still the one that was written (a newer outcome
+    queued meanwhile stays pending)."""
+    now = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE sheet_sync SET status = ?, synced_at = ?, last_attempt_at = ?, attempts = attempts + 1,
+                last_error_code = NULL, last_error = NULL
+            WHERE job_row_id = ? AND application_state IS ? AND application_code IS ?
+            """,
+            (SHEET_SYNC_SYNCED, now, now, job_row_id, application_state, application_code),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def mark_sheet_sync_failed(job_row_id: int, code: str, error: str) -> None:
+    """Record a failed sync; the row stays PENDING and is retried next run. Never touches jobs/applied_jobs."""
+    now = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            UPDATE sheet_sync SET status = ?, attempts = attempts + 1, last_error_code = ?, last_error = ?,
+                last_attempt_at = ?
+            WHERE job_row_id = ?
+            """,
+            (SHEET_SYNC_PENDING, code, (error or "")[:500], now, job_row_id),
+        )
+        conn.commit()
+
+
 def close_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -595,4 +763,13 @@ __all__ = [
     "open_attempts",
     "resolve_unconfirmed_record",
     "get_jobs_by_application_state",
+    "canonical_job_url",
+    "find_successful_application",
+    "count_successful_applications",
+    "SHEET_SYNC_PENDING",
+    "SHEET_SYNC_SYNCED",
+    "queue_sheet_sync",
+    "get_sheet_syncs",
+    "mark_sheet_synced",
+    "mark_sheet_sync_failed",
 ]
