@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import tempfile
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,16 @@ MAX_DESCRIPTION_CHARS = 30_000
 MAX_FIELD_CHARS = 160
 AGENT_QUALIFY_CUTOFF = 8  # the AI Agent's QUALIFY_CUTOFF; informational, never applied to the Agent
 REVIEW_MIN_SCORE = 6
+
+# Scoped Agent runs: the exact jobs exported this run are listed in this file (next to the export)
+# and passed to the Agent's scoring and tailoring stages as --job-ids-file (Agent: scripts/job_scope.py).
+SCOPE_FILE_NAME = "agent_job_scope.json"
+SCOPE_ARG = "--job-ids-file"
+SCOPE_REPORT_NAME = "scoped_run_report.json"  # written by the Agent, per run_id
+# Stages that honour the scope (score/tailor) or never score/tailor (scrape only merges the handoff).
+# Any other stage in a scoped run is refused: it might process jobs outside the scope.
+SCOPED_STAGES = ("score_jobs.py", "tailor_job.py")
+SCOPE_SAFE_STAGES = ("scrape_jobs.py",) + SCOPED_STAGES
 
 _CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _TAG = re.compile(r"<[^>]{1,200}>")
@@ -124,6 +135,17 @@ class ExportResult:
     skipped: list[tuple[str, str]] = field(default_factory=list)  # (job reference, reason)
     exported: list[dict] = field(default_factory=list)
     filtered_out: int = 0  # rejected by export_discovered_jobs(job_filter=...)
+    # Valid records past the per-run limit: (job reference, reason). They stay 'discovered' and are
+    # offered again on the next run (while the pipeline still finds them fresh).
+    deferred: list[tuple[str, str]] = field(default_factory=list)
+    # One (jobs.id, decision, reason) per job that reached the record check: EXPORTED, DEFERRED, REJECTED.
+    decisions: list[tuple[int, str, str]] = field(default_factory=list)
+    run_id: str = ""  # identifies this export in the scope file and the Agent's scoped report
+    scope_path: Optional[Path] = None  # the exact exported jobs, for the Agent's --job-ids-file
+
+    @property
+    def exported_ids(self) -> list[int]:
+        return [job_id for job_id, decision, _ in self.decisions if decision == "EXPORTED"]
 
 
 def export_discovered_jobs(
@@ -152,17 +174,55 @@ def export_discovered_jobs(
         reference = f"{job.get('title') or '?'} @ {job.get('company') or '?'} [{job.get('job_id') or job['id']}]"
         if record is None:
             result.skipped.append((reference, note))
+            result.decisions.append((job["id"], "REJECTED", note))
             logger.warning(f"Not exporting {reference}: {note}")
             continue
         if note:
             result.supplemented += 1
             logger.info(f"Export description for {reference} {note}")
-        eligible.append(record)
+        eligible.append((job, reference, record))
     result.eligible = len(eligible)
-    result.exported = eligible[: result.limit]
+    for position, (job, reference, record) in enumerate(eligible):
+        if position < result.limit:
+            result.exported.append(record)
+            result.decisions.append((job["id"], "EXPORTED", ""))
+        else:
+            reason = f"export limit reached (AI_AGENT_EXPORT_LIMIT={result.limit}; oldest first)"
+            result.deferred.append((reference, reason))
+            result.decisions.append((job["id"], "DEFERRED", reason))
+            logger.info(f"Deferred {reference}: {reason}")
     _write_json_atomic(result.path, result.exported)
-    logger.info(f"Exported {len(result.exported)} of {result.eligible} eligible jobs to {result.path}")
+    result.run_id = f"{datetime.now().strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    result.scope_path = scope_file_for(result.path)
+    _write_json_atomic(result.scope_path, {
+        "run_id": result.run_id,
+        "jobs": [{"id": scope_id(record), "link": record["link"]} for record in result.exported],
+    })
+    logger.info(f"Exported {len(result.exported)} of {result.eligible} eligible jobs to {result.path}"
+                + (f"; {len(result.deferred)} deferred by the export limit" if result.deferred else ""))
     return result
+
+
+def scope_file_for(export_path: Path) -> Path:
+    return Path(export_path).with_name(SCOPE_FILE_NAME)
+
+
+def scope_id(record: dict) -> str:
+    """The id a job carries in the scope file and the Agent's report: the Naukri job id, else dedup key."""
+    return str(record.get("source_job_id") or record.get("dedup_key") or agent_canonical_link(record["link"]))
+
+
+def read_scope_report(output_dir: Optional[Path], run_id: str) -> Optional[dict]:
+    """The Agent's report for this run (output/scoped_run_report.json), or None when it is missing,
+    unreadable or belongs to another run -- then the scoped counts are unknown, never zero."""
+    if output_dir is None or not run_id:
+        return None
+    path = Path(output_dir) / SCOPE_REPORT_NAME
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return report if isinstance(report, dict) and report.get("run_id") == run_id else None
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +353,7 @@ AGENT_NOT_CONFIGURED = "AGENT_NOT_CONFIGURED"
 AGENT_NOT_FOUND = "AGENT_NOT_FOUND"
 AGENT_STAGE_FAILED = "AGENT_STAGE_FAILED"
 AGENT_TIMEOUT = "AGENT_TIMEOUT"
+AGENT_SCOPE_UNSUPPORTED = "AGENT_SCOPE_UNSUPPORTED"
 
 
 @dataclass
@@ -342,10 +403,16 @@ def run_agent_stages(
     python: Optional[Path] = None,
     timeout_minutes: int = 60,
     runner: Callable[..., Any] = subprocess.run,
+    scope_path: Optional[Path] = None,
 ) -> AgentRunResult:
     """Run the AI Agent's own stage scripts (scripts/<stage>) in its folder, in order, stopping at
     the first failure. This is the same file handoff as before -- the Agent reads NAUKRI_JOBS_PATH
-    and writes output/scored_jobs.json -- just started by the pipeline instead of by hand."""
+    and writes output/scored_jobs.json -- just started by the pipeline instead of by hand.
+
+    scope_path: a scoped run. The scoring/tailoring stages get --job-ids-file <scope_path>, so only
+    the exported jobs can be scored or tailored. Refused up front (nothing runs) if the Agent has no
+    scope support (scripts/job_scope.py) or a stage is not known to honour the scope: a scoped run
+    never falls back to an unscoped one."""
     if agent_dir is None:
         return AgentRunResult(False, code=AGENT_NOT_CONFIGURED,
                               message="AI_AGENT_DIR / AI_AGENT_OUTPUT_DIR is not set in .env")
@@ -355,15 +422,29 @@ def run_agent_stages(
         return AgentRunResult(False, code=AGENT_NOT_FOUND,
                               message=f"AI Agent Python not found (expected {agent_dir / '.venv'}; set AI_AGENT_PYTHON)")
     env = agent_environment(Path(export_path or NAUKRI_EXPORT_PATH))
+    if scope_path is not None:
+        if not (agent_dir / "scripts" / "job_scope.py").exists():
+            return AgentRunResult(False, code=AGENT_SCOPE_UNSUPPORTED,
+                                  message="this AI Agent version has no scoped runs (scripts/job_scope.py); "
+                                          "not run, so jobs outside this export are not scored or tailored")
+        unsafe = [stage for stage in stages if stage not in SCOPE_SAFE_STAGES]
+        if unsafe:
+            return AgentRunResult(False, code=AGENT_SCOPE_UNSUPPORTED,
+                                  message=f"stage(s) {', '.join(unsafe)} cannot be limited to the exported jobs; "
+                                          f"use only {', '.join(SCOPE_SAFE_STAGES)} in AI_AGENT_STAGES")
+        if not Path(scope_path).exists():
+            return AgentRunResult(False, code=AGENT_SCOPE_UNSUPPORTED, message=f"scope file not found: {scope_path}")
     result = AgentRunResult(True)
     for stage in stages:
         script = agent_dir / "scripts" / stage
         if not script.exists():
             return AgentRunResult(False, result.stages_run, stage, AGENT_NOT_FOUND, f"AI Agent script not found: {script}")
-        logger.info(f"AI Agent stage started: {stage}")
+        logger.info(f"AI Agent stage started: {stage}" + (" (scoped)" if scope_path and stage in SCOPED_STAGES else ""))
+        argv = [str(interpreter), str(script)]
+        if scope_path is not None and stage in SCOPED_STAGES:
+            argv += [SCOPE_ARG, str(Path(scope_path).resolve())]
         try:
-            completed = runner([str(interpreter), str(script)], cwd=str(agent_dir), env=env,
-                               timeout=timeout_minutes * 60, check=False)
+            completed = runner(argv, cwd=str(agent_dir), env=env, timeout=timeout_minutes * 60, check=False)
         except subprocess.TimeoutExpired:
             return AgentRunResult(False, result.stages_run, stage, AGENT_TIMEOUT,
                                   f"{stage} did not finish within {timeout_minutes} minutes")

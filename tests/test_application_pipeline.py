@@ -63,6 +63,7 @@ class PipelineTestCase(Phase3TestCase):
         self.gws = FakeGws()
         self.prompts = []
         self.agent_calls = []
+        self.agent_scopes = []  # the scope file each Agent run received (scoped runs only)
 
     def settings(self, **overrides):
         values = dict(mode="SAFE", window_hours=24, score_threshold=8, preferred_locations=[], max_applications=5,
@@ -101,8 +102,16 @@ class PipelineTestCase(Phase3TestCase):
             prompt=prompt, out=lambda *_: None, **flags)
         return p.run()
 
-    def fake_agent(self, agent_dir, stages, export_path, python, timeout):
+    def write_agent_report(self, scope_path, **sections):
+        """What the real Agent writes for a scoped run (scripts/job_scope.py): output/scoped_run_report.json."""
+        scope = json.loads(Path(scope_path).read_text(encoding="utf-8"))
+        report = {"run_id": scope["run_id"], "scope_file": str(scope_path), "ids": [j["id"] for j in scope["jobs"]],
+                  **sections}
+        (self.agent_out / "scoped_run_report.json").write_text(json.dumps(report), encoding="utf-8")
+
+    def fake_agent(self, agent_dir, stages, export_path, python, timeout, scope_path=None):
         self.agent_calls.append(json.loads(Path(export_path).read_text(encoding="utf-8")))
+        self.agent_scopes.append(scope_path)
         return AgentRunResult(True, list(stages))
 
 
@@ -220,12 +229,14 @@ class TestOrchestrator(PipelineTestCase):
     def test_full_flow_scan_export_score_import_apply_track(self):
         scanner = FakeScanner(self, jobs=["900000000001"])
 
-        def agent(agent_dir, stages, export_path, python, timeout):
+        def agent(agent_dir, stages, export_path, python, timeout, scope_path=None):
             exported = json.loads(Path(export_path).read_text(encoding="utf-8"))
             self.agent_calls.append(exported)
             scored = [dict(e, score=9, reasoning="strong fit", matched_must_haves=["Java"], missing_must_haves=[])
                       for e in exported]
             (self.agent_out / "scored_jobs.json").write_text(json.dumps(scored), encoding="utf-8")
+            ids = [e["source_job_id"] for e in exported]
+            self.write_agent_report(scope_path, score={"newly_scored": ids}, tailor={"newly_tailored": []})
             return AgentRunResult(True, list(stages))
 
         summary = self.run_pipeline(answers=("y",), scanner=scanner, agent=agent)
@@ -283,7 +294,7 @@ class TestOrchestrator(PipelineTestCase):
 
     def test_agent_failure_is_reported_and_the_run_continues(self):
         self.add_job("900000000001", scored=False, posted_label="2 hours ago")
-        failing = lambda *a: AgentRunResult(False, failed_stage="score_jobs.py", code="AGENT_STAGE_FAILED",  # noqa: E731
+        failing = lambda *a, **k: AgentRunResult(False, failed_stage="score_jobs.py", code="AGENT_STAGE_FAILED",  # noqa: E731
                                             message="score_jobs.py exited with code 1")
         summary = self.run_pipeline(agent=failing)
         self.assertIn("AGENT_STAGE_FAILED", summary.agent_status)

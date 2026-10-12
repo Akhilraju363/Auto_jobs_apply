@@ -52,6 +52,9 @@ _COL = {name: index for index, name in enumerate(HEADERS)}
 
 # Sync result codes (also stored in sheet_sync.last_error_code).
 SYNCED = "SYNCED"
+# Nothing was queued: the tracker only receives application outcomes (apply / recover), so a
+# --no-apply or dry run normally has none. Not a failure and not "rows written".
+UP_TO_DATE = "UP_TO_DATE"
 SYNC_PENDING = "SYNC_PENDING"
 AUTH_REQUIRED = "AUTH_REQUIRED"
 GWS_NOT_INSTALLED = "GWS_NOT_INSTALLED"
@@ -288,7 +291,7 @@ class SheetTracker:
 
 @dataclass
 class SyncReport:
-    status: str = SYNCED  # SYNCED, SYNC_PENDING, AUTH_REQUIRED, GWS_NOT_INSTALLED, SHEET_NOT_CONFIGURED, DISABLED
+    status: str = SYNCED  # SYNCED, UP_TO_DATE (nothing pending), SYNC_PENDING, AUTH_REQUIRED, GWS_NOT_INSTALLED, SHEET_NOT_CONFIGURED, DISABLED
     synced: int = 0
     pending: int = 0
     errors: list[str] = field(default_factory=list)
@@ -340,6 +343,8 @@ def sync_pending_outcomes(tracker: Optional[SheetTracker], unavailable_code: Opt
         report.status = stop.code
     elif report.pending:
         report.status = SYNC_PENDING
+    elif not pending:
+        report.status = UP_TO_DATE
     return report
 
 
@@ -353,6 +358,7 @@ __all__ = [
     "NAUKRI_HEADERS",
     "SHEET_NOT_CONFIGURED",
     "SYNCED",
+    "UP_TO_DATE",
     "SYNC_FAILED",
     "SYNC_PENDING",
     "SheetTracker",

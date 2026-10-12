@@ -22,9 +22,11 @@ one SAFE-mode application has been confirmed.
 """
 
 import argparse
+import json
 import logging
 import shutil
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +35,7 @@ from typing import Callable, Optional
 from config import (
     AI_AGENT_DIR,
     AI_AGENT_EXPORT_LIMIT,
+    AI_AGENT_EXPORT_LIMIT_SETTING,
     AI_AGENT_OUTPUT_DIR,
     AI_AGENT_PYTHON,
     AI_AGENT_STAGES,
@@ -53,6 +56,8 @@ from config import (
 )
 from ai_agent_bridge import (
     AgentRunResult,
+    agent_canonical_link,
+    read_scope_report,
     export_discovered_jobs,
     import_agent_scores,
     resolve_agent_python,
@@ -69,6 +74,7 @@ from db import (
     JOB_STATUS_DISCOVERED,
     count_successful_applications,
     get_application_candidates,
+    get_job,
     get_jobs,
     has_successful_application,
     init_db,
@@ -165,6 +171,7 @@ def validate_configuration(settings: PipelineSettings) -> list[ConfigCheck]:
             "AUTO is refused until one SAFE-mode application has been confirmed end to end "
             "(set APPLICATION_MODE=SAFE and apply to one job first)"))
     checks.append(ConfigCheck("APPLICATION_JOB_WINDOW_HOURS", settings.window_hours > 0, f"{settings.window_hours}h"))
+    checks.append(export_limit_check(AI_AGENT_EXPORT_LIMIT_SETTING, settings.export_limit))
     threshold_ok = 1 <= float(settings.score_threshold) <= 10
     checks.append(ConfigCheck("APPLICATION_SCORE_THRESHOLD", threshold_ok,
                               f"{settings.score_threshold:g}/10" if threshold_ok else "must be between 1 and 10"))
@@ -184,6 +191,11 @@ def validate_configuration(settings: PipelineSettings) -> list[ConfigCheck]:
         "AI Agent folder", bool(agent_dir and (agent_dir / "scripts").is_dir()),
         str(agent_dir) if agent_dir and (agent_dir / "scripts").is_dir() else
         "AI_AGENT_DIR / AI_AGENT_OUTPUT_DIR not set or not the AI Agent checkout: scoring is skipped", fatal=False))
+    scoped = bool(agent_dir and (agent_dir / "scripts" / "job_scope.py").exists())
+    checks.append(ConfigCheck(
+        "AI Agent scoped runs", scoped,
+        "supported: only the jobs exported each run are scored/tailored" if scoped else
+        "this Agent version has no scripts/job_scope.py: it will not be run (no unscoped fallback)", fatal=False))
     python = resolve_agent_python(agent_dir, settings.agent_python)
     checks.append(ConfigCheck("AI Agent Python", python is not None,
                               str(python) if python else "not found: set AI_AGENT_PYTHON", fatal=False))
@@ -203,6 +215,22 @@ def validate_configuration(settings: PipelineSettings) -> list[ConfigCheck]:
     else:
         checks.append(ConfigCheck("Google Sheets", True, "disabled (GOOGLE_SHEETS_ENABLED=false)", fatal=False))
     return checks
+
+
+def export_limit_check(raw: str, effective: int) -> ConfigCheck:
+    """AI_AGENT_EXPORT_LIMIT as configured vs as used. Never fatal: an invalid value falls back (see config)."""
+    detail = (f"{effective} job(s)/run; deferred fresh jobs are offered again next run, a low cap can let "
+              "them expire before scoring, a higher cap means more AI calls")
+    if not raw:
+        return ConfigCheck("AI_AGENT_EXPORT_LIMIT", True, f"{detail} (unset: default 2)", fatal=False)
+    try:
+        value = int(raw)
+    except ValueError:
+        return ConfigCheck("AI_AGENT_EXPORT_LIMIT", False, f"{raw!r} is not a whole number: using {effective}",
+                           fatal=False)
+    if value < 1:
+        return ConfigCheck("AI_AGENT_EXPORT_LIMIT", False, f"{raw!r} is below 1: using {effective}", fatal=False)
+    return ConfigCheck("AI_AGENT_EXPORT_LIMIT", True, detail, fatal=False)
 
 
 def configuration_ok(checks: list[ConfigCheck]) -> bool:
@@ -284,9 +312,35 @@ class RunSummary:
     jobs_scanned: int = 0
     new_jobs: int = 0
     duplicates_removed: int = 0
+    skipped_stale_cards: int = 0  # search cards already older than the window (detail page never opened)
+    skipped_experience_cards: int = 0  # search cards whose Naukri experience minimum exceeds the resume
+    description_missing: int = 0  # job pages without a readable description (not stored; retried next scan)
     scan_status: str = "SKIPPED"
     fresh_jobs: int = 0
     already_applied: int = 0
+    # Export funnel over stored, unscored ('discovered') jobs.
+    discovered_unscored: int = 0  # all stored jobs still waiting for an AI score
+    not_fresh_unscored: int = 0  # of those, not fresh (STALE or UNKNOWN): never exported
+    export_candidates: int = 0  # fresh, never applied, experience ELIGIBLE: offered to the export
+    export_rejected: int = 0  # offered but not a valid Agent record (e.g. description < 80 chars)
+    export_deferred: int = 0  # valid but past AI_AGENT_EXPORT_LIMIT: offered again next run if still fresh
+    export_limit: int = 0
+    exported_ids: list = field(default_factory=list)  # jobs.id of the jobs exported this run
+    # What the AI Agent newly scored / tailored during this run (from its output files, before vs after):
+    # jobs this run exported vs anything else it processed (e.g. its own cached LinkedIn jobs).
+    agent_new_scored: Optional[int] = None
+    agent_new_scored_other: Optional[int] = None
+    agent_new_tailored: Optional[int] = None
+    agent_new_tailored_other: Optional[int] = None
+    agent_new_in_store: Optional[int] = None  # exported jobs the Agent's raw_jobs.json did not hold before
+    # The Agent's own per-run report of the scoped run (ids from the scope file); None = unknown.
+    scope_report: Optional[dict] = None
+    # Scores imported into SQLite for this run's exported jobs (others imported are historical Agent data).
+    exported_scored: int = 0
+    exported_recommended: int = 0
+    # Experience gate results, by where they happened.
+    export_experience_ineligible: int = 0  # unscored fresh jobs, before export (no AI call spent)
+    export_experience_review: int = 0
     experience_ineligible: int = 0  # INELIGIBLE: skipped before scoring/tailoring or at eligibility
     experience_review: int = 0  # REVIEW_REQUIRED: requirement unreadable or conflicting; never applied
     exported: int = 0
@@ -354,11 +408,14 @@ class ApplicationPipeline:
             self._verified, self._verified_loaded = verified_experience(self.settings), True
         return self._verified
 
-    def _experience_rejected(self, job: dict, status: str, reason: str) -> None:
+    def _experience_rejected(self, job: dict, status: str, reason: str, before_export: bool = False) -> None:
+        s = self.summary
         if status == INELIGIBLE:
-            self.summary.experience_ineligible += 1
+            s.experience_ineligible += 1
+            s.export_experience_ineligible += int(before_export)
         elif status == REVIEW_REQUIRED:
-            self.summary.experience_review += 1
+            s.experience_review += 1
+            s.export_experience_review += int(before_export)
         self.out(f"  [{job['id']}] {job.get('title') or '?'} @ {job.get('company') or '?'}: {reason}")
 
     # -- steps -------------------------------------------------------------------------
@@ -423,6 +480,9 @@ class ApplicationPipeline:
         finally:
             scanner.close()
         s.jobs_scanned, s.new_jobs, s.duplicates_removed = result.unique_jobs, result.new_jobs_stored, result.duplicates_skipped
+        s.skipped_stale_cards = getattr(result, "skipped_stale", 0)
+        s.skipped_experience_cards = getattr(result, "skipped_experience", 0)
+        s.description_missing = getattr(result, "description_missing", 0)
         s.scan_status = f"STOPPED ({result.stopped_reason})" if result.stopped_reason else "OK"
         if result.stopped_reason:
             s.warnings.append(f"Naukri scan stopped early: {result.stopped_reason}")
@@ -438,9 +498,18 @@ class ApplicationPipeline:
         pending = []
         header = False
         for job in get_jobs(status=None):
+            unscored = job.get("status") == JOB_STATUS_DISCOVERED
+            self.summary.discovered_unscored += int(unscored)
             if job.get("application_state") in FINAL_APPLICATION_STATES and not already_applied(job):
+                if unscored:
+                    logger.debug(f"Not exported | db_id={job['id']} | application state {job.get('application_state')}")
                 continue  # external / unavailable: nothing left to do
-            if job_freshness(job, reference_time=reference, window_hours=self.settings.window_hours)[0] != FRESH:
+            freshness = job_freshness(job, reference_time=reference, window_hours=self.settings.window_hours)[0]
+            if freshness != FRESH:
+                if unscored:
+                    self.summary.not_fresh_unscored += 1
+                    logger.debug(f"Not exported | db_id={job['id']} | freshness {freshness} "
+                                 f"(posted {job.get('posted_label') or '?'})")
                 continue
             self.summary.fresh_jobs += 1
             if already_applied(job):
@@ -453,30 +522,44 @@ class ApplicationPipeline:
                 if not header:
                     self.out("Experience check (before AI scoring / tailoring):")
                     header = True
-                self._experience_rejected(job, check.status, check.reason)
+                self._experience_rejected(job, check.status, check.reason, before_export=True)
         return pending
 
     def export_and_score(self, fresh_pending: list[dict]) -> None:
         s = self.summary
         wanted = {job["id"] for job in fresh_pending}
+        s.export_candidates, s.export_limit = len(fresh_pending), self.settings.export_limit
         if self.dry_run:
             s.exported = min(len(fresh_pending), self.settings.export_limit)
+            s.export_deferred = max(0, len(fresh_pending) - s.exported)
             s.agent_status = "SKIPPED (dry run)"
         else:
             export = export_discovered_jobs(self.settings.export_path, self.settings.export_limit,
                                             job_filter=lambda job: job["id"] in wanted)
-            s.exported = len(export.exported)
+            s.exported, s.export_rejected, s.export_deferred = (len(export.exported), len(export.skipped),
+                                                                len(export.deferred))
+            s.exported_ids = export.exported_ids
+            self._print_export_decisions(fresh_pending, export.decisions)
             if self.skip_agent:
                 s.agent_status = "SKIPPED (--skip-agent)"
             elif not export.exported:
                 s.agent_status = "SKIPPED (no fresh unscored jobs)"
             else:
+                before = agent_output_links(self.settings.agent_output_dir)
+                # Scoped: only the jobs exported above may be scored or tailored. A failure is reported
+                # as it is; there is no retry without the scope.
                 result = self.agent_runner(self.settings.agent_dir, self.settings.agent_stages,
                                            self.settings.export_path, self.settings.agent_python,
-                                           self.settings.agent_timeout_minutes)
+                                           self.settings.agent_timeout_minutes, scope_path=export.scope_path)
                 s.agent_status = "OK" if result.ok else f"{result.code}: {result.message}"
                 if not result.ok:
                     s.warnings.append(f"AI Agent: {result.code}: {result.message}")
+                self._account_agent_activity(before, agent_output_links(self.settings.agent_output_dir),
+                                             {agent_canonical_link(r["link"]) for r in export.exported})
+                s.scope_report = read_scope_report(self.settings.agent_output_dir, export.run_id)
+                if result.ok and s.scope_report is None:
+                    s.warnings.append("AI Agent finished but wrote no report for this scoped run "
+                                      f"(run {export.run_id}): newly scored/tailored counts are unknown")
         if self.dry_run or self.settings.agent_output_dir is None:
             return
         scored_path = Path(self.settings.agent_output_dir) / "scored_jobs.json"
@@ -491,6 +574,40 @@ class ApplicationPipeline:
         s.recommended = imported.by_status.get("recommended", 0)
         s.review = imported.by_status.get("review", 0)
         s.skipped_scores = imported.by_status.get("skipped", 0)
+        for job_id in s.exported_ids:  # this run's own results, apart from historical Agent data
+            job = get_job(job_id)
+            if job and job.get("scored_at"):
+                s.exported_scored += 1
+                s.exported_recommended += int(job.get("match_status") == "recommended")
+
+    def _print_export_decisions(self, fresh_pending: list[dict], decisions: list) -> None:
+        """One line per fresh, experience-eligible, unscored job: exported, deferred or rejected, and why."""
+        if not decisions:
+            return
+        jobs = {job["id"]: job for job in fresh_pending}
+        counts = Counter(decision for _, decision, _ in decisions)
+        self.out(f"Export to AI Agent: {len(decisions)} fresh, experience-eligible, unscored job(s) -> "
+                 + ", ".join(f"{counts[d]} {d.lower()}" for d in ("EXPORTED", "DEFERRED", "REJECTED") if counts[d]))
+        for job_id, decision, reason in decisions:
+            job = jobs.get(job_id, {})
+            self.out(f"  [{job_id}] {decision:<8} {job.get('title') or '?'} @ {job.get('company') or '?'}"
+                     + (f": {reason}" if reason else ""))
+
+    def _account_agent_activity(self, before: Optional[tuple], after: Optional[tuple], exported: set) -> None:
+        """Separate what the Agent newly scored/tailored for this run's export from anything else it
+        processed (its outputs are cumulative and also hold its own cached jobs)."""
+        if before is None or after is None:
+            return  # output files unreadable: unknown, not zero
+        s = self.summary
+        new_scored, new_tailored = after[0] - before[0], after[1] - before[1]
+        s.agent_new_in_store = len(exported - before[2])
+        s.agent_new_scored, s.agent_new_scored_other = len(new_scored & exported), len(new_scored - exported)
+        s.agent_new_tailored, s.agent_new_tailored_other = len(new_tailored & exported), len(new_tailored - exported)
+        if s.agent_new_scored_other or s.agent_new_tailored_other:
+            s.warnings.append(
+                f"AI Agent also scored {s.agent_new_scored_other} and tailored {s.agent_new_tailored_other} job(s) "
+                "this run did not export (e.g. its own cached LinkedIn jobs); those did not pass this project's "
+                "freshness or experience checks")
 
     def eligibility(self) -> list[dict]:
         reference = self.clock()
@@ -611,6 +728,25 @@ def run_eligibility_check(settings: PipelineSettings, out: Callable[[str], None]
     return groups
 
 
+def agent_output_links(output_dir: Optional[Path]) -> Optional[tuple[set, set]]:
+    """(canonical links in the Agent's scored_jobs.json, links saved in its tailored_jobs.json, links in
+    its raw_jobs.json store), read-only; None when they cannot be read. Missing files are empty sets."""
+    if output_dir is None:
+        return None
+    sets = []
+    for name, keep in (("scored_jobs.json", lambda e: True),
+                       ("tailored_jobs.json", lambda e: e.get("status") == "saved"),
+                       ("raw_jobs.json", lambda e: True)):
+        path = Path(output_dir) / name
+        try:
+            entries = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+        except (OSError, ValueError):
+            return None
+        sets.append({agent_canonical_link(e["link"]) for e in entries
+                     if isinstance(e, dict) and e.get("link") and keep(e)})
+    return sets[0], sets[1], sets[2]
+
+
 def _default_scanner():
     from naukri_scanner import NaukriScanner
     return NaukriScanner(headless=False)
@@ -635,13 +771,49 @@ def _default_tracker(sheet_id: str, tab: str) -> SheetTracker:
 # ---------------------------------------------------------------------------
 
 
+def _count(values) -> int:
+    return len(values or [])
+
+
+def _agent_lines(s: RunSummary, row) -> list[str]:
+    """This run's scoped Agent results, from the Agent's own report for this run (ids from the scope
+    file). Unknown -- never 0 -- when the Agent did not run, wrote no report for this run, or a stage
+    did not record its part (e.g. tailoring stopped before writing it)."""
+    if s.scope_report is None:
+        unknown = "unknown (no report for this run)" if s.agent_status == "OK" else "-"
+        return [row("Newly scored", unknown), row("Newly tailored", unknown)]
+    score, tailor = s.scope_report.get("score"), s.scope_report.get("tailor")
+
+    def count(section, key):
+        return _count(section.get(key)) if isinstance(section, dict) else "unknown (stage did not report)"
+
+    def pair(first, second):
+        """'<n> scored, <m> tailored' style; each half is 'unknown' when its stage did not report."""
+        parts = []
+        for section, key, label in (first, second):
+            value = count(section, key)
+            parts.append(f"{value if isinstance(value, int) else 'unknown'} {label}")
+        return ", ".join(parts)
+
+    return [
+        row("Newly scored", count(score, "newly_scored")),
+        row("Newly tailored", count(tailor, "newly_tailored")),
+        row("Already processed (skipped)", pair((score, "already_scored", "scored"), (tailor, "already_tailored", "tailored"))),
+        row("Below the 8+ cutoff", count(tailor, "not_qualified")),
+        row("Not in the Agent store", count(score, "missing")),
+        row("Failed / flagged", pair((score, "failed", "scoring"), (tailor, "flagged", "tailoring"))),
+    ]
+
+
 def format_summary(s: RunSummary) -> str:
     wide, thin = "=" * 60, "-" * 60
 
     def row(label: str, value) -> str:
-        return f"{label + ':':<26}{value:>8}" if isinstance(value, int) else f"{label + ':':<26}{value}"
+        return f"{label + ':':<38}{value:>6}" if isinstance(value, int) else f"{label + ':':<38}{value}"
 
     sheet_status = s.sheets.status
+    candidate_ineligible = s.experience_ineligible - s.export_experience_ineligible
+    candidate_review = s.experience_review - s.export_experience_review
     lines = [wide, "         NAUKRI AUTO JOB APPLICATION", wide, "",
              row("Mode", s.mode + (" (DRY RUN)" if s.dry_run else "")),
              row("Naukri login", s.naukri_login),
@@ -649,20 +821,40 @@ def format_summary(s: RunSummary) -> str:
              row("Jobs scanned", s.jobs_scanned),
              row("New jobs stored", s.new_jobs),
              row("Duplicates removed", s.duplicates_removed),
-             row(f"Fresh jobs (<{s.window_hours}h)", s.fresh_jobs),
-             row("Already applied", s.already_applied),
-             row("Would export (dry run)" if s.dry_run else "Exported to AI Agent", s.exported),
-             "", "AI SCORING", thin,
-             row("AI Agent", s.agent_status),
-             row("Recommended", s.recommended),
-             row("Review", s.review),
-             row("Skipped", s.skipped_scores),
-             "", "ELIGIBILITY", thin,
-             row("Recommended candidates", s.candidates),
-             row("Experience: skipped", s.experience_ineligible),
-             row("Experience: review", s.experience_review),
-             row("Eligible", s.eligible),
-             "", "APPLICATIONS", thin]
+             row(f"Skipped: older than {s.window_hours}h", s.skipped_stale_cards),
+             row("Skipped: experience > resume", s.skipped_experience_cards),
+             row("No description (retry)", s.description_missing),
+             row(f"Fresh stored jobs (<{s.window_hours}h)", s.fresh_jobs),
+             row("  already applied", s.already_applied),
+             "", "EXPORT TO AI AGENT (this run)", thin,
+             row("Unscored jobs evaluated", s.discovered_unscored),
+             row(f"  not fresh (<{s.window_hours}h)", s.not_fresh_unscored),
+             row("  experience: skipped", s.export_experience_ineligible),
+             row("  experience: review required", s.export_experience_review),
+             row("Fresh, experience-eligible", s.export_candidates),
+             row("  rejected (invalid record)", s.export_rejected),
+             row("  would export (dry run)" if s.dry_run else "  exported to AI Agent", s.exported),
+             row(f"  deferred (limit {s.export_limit}/run)", s.export_deferred),
+             "", "AI AGENT (this run's exported jobs only)", thin,
+             row("AI Agent", s.agent_status)]
+    if s.exported and not s.dry_run:
+        lines += _agent_lines(s, row)
+        if s.agent_new_in_store is not None:
+            lines.append(row("New to the Agent store", s.agent_new_in_store))
+        if s.agent_new_scored_other is not None:
+            lines.append(row("Other jobs the Agent processed", f"{s.agent_new_scored_other} scored, "
+                                                                f"{s.agent_new_tailored_other} tailored"))
+    lines += ["", "AI SCORING (imported into SQLite)", thin,
+              row("This run's exports scored", s.exported_scored),
+              row("  recommended (8+)", s.exported_recommended),
+              row("All scores imported this run", s.scores_imported),
+              row("  recommended / review / skipped", f"{s.recommended} / {s.review} / {s.skipped_scores}"),
+              "", "ELIGIBILITY (application candidates)", thin,
+              row("Recommended, not applied (all runs)", s.candidates),
+              row("  experience: skipped", candidate_ineligible),
+              row("  experience: review required", candidate_review),
+              row("Eligible to apply now", s.eligible),
+              "", "APPLICATIONS", thin]
     if s.dry_run:
         lines.append(row("Ready (dry run)", s.dry_run_ready))
     lines += [row("Applied", s.applied),
@@ -671,7 +863,7 @@ def format_summary(s: RunSummary) -> str:
               row("Recovery required", s.recovery_required),
               "", "GOOGLE SHEETS", thin,
               row("Status", sheet_status),
-              row("Synced", s.sheets.synced),
+              row("Rows written", s.sheets.synced),
               row("Pending sync", s.sheets.pending)]
     if s.fatal or s.warnings:
         lines += ["", "ATTENTION", thin] + [f"- {w}" for w in ([s.fatal] if s.fatal else []) + s.warnings]

@@ -98,6 +98,9 @@ AI_AGENT_OUTPUT_DIR = resolve_project_path(_ai_agent_output) if _ai_agent_output
 NAUKRI_EXPORT_PATH = resolve_project_path(
     os.getenv("NAUKRI_EXPORT_PATH", "").strip() or "exports/naukri_jobs.json"
 )
+# Jobs sent to the AI Agent per run (each one may cost a scoring and a tailoring LLM call). Default 2.
+# Not a whole number -> the default 2; below 1 -> 1. --check-config shows the effective value.
+AI_AGENT_EXPORT_LIMIT_SETTING = os.getenv("AI_AGENT_EXPORT_LIMIT", "").strip()
 AI_AGENT_EXPORT_LIMIT = max(1, _env_number("AI_AGENT_EXPORT_LIMIT", 2))
 
 # Phase 3 application preparation (headed browser only; Naukri login comes from the saved
@@ -172,6 +175,7 @@ __all__ = [
     "AI_AGENT_OUTPUT_DIR",
     "NAUKRI_EXPORT_PATH",
     "AI_AGENT_EXPORT_LIMIT",
+    "AI_AGENT_EXPORT_LIMIT_SETTING",
     "NAUKRI_APPLICATION_TIMEOUT",
     "APPLICATION_MAX_JOBS",
     "NAUKRI_LOGIN_WAIT_MINUTES",

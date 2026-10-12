@@ -122,6 +122,29 @@ check before clicking Apply. Results are stored on `jobs` (`experience_required`
 python application_pipeline.py --eligibility-check
 ```
 
+## Reading the run summary
+
+Every count is about **this run** unless it says "all runs".
+
+- **Fresh stored jobs**: every stored job inside the window, scored or not.
+- **Export to AI Agent (this run)**, unscored jobs only: not fresh -> never exported; experience
+  INELIGIBLE / REVIEW_REQUIRED -> never exported (reason printed per job); the rest are "fresh,
+  experience-eligible" and each prints one line: `EXPORTED`, `DEFERRED` (past `AI_AGENT_EXPORT_LIMIT`;
+  oldest first; stays unscored and is offered again on a later run while still fresh) or `REJECTED`
+  (e.g. description under 80 characters).
+- **AI Agent (this run's exported jobs only)**: from the Agent's report for this run
+  (`output/scoped_run_report.json`, matched by run id): newly scored, newly tailored, already processed
+  (skipped), below the 8+ cutoff, not in the Agent store, failed/flagged. "unknown" means the Agent
+  wrote no report for this run -- never read as 0. "Other jobs the Agent processed" compares its output
+  files before and after the run and should be 0 in a scoped run; anything else is a warning. The
+  Agent's own console counts (e.g. "68 already scored", "12 qualified") are its cumulative history.
+- **AI scoring (imported into SQLite)**: "This run's exports scored / recommended" are this run's
+  results. "All scores imported" can also include earlier exports the Agent scored outside this run.
+- **Eligibility**: "Recommended, not applied (all runs)" is every AI-recommended job in history;
+  "Eligible to apply now" also passed freshness, experience, score and resume checks today.
+- **Google Sheets**: only application outcomes (apply / recover) are queued. `UP_TO_DATE` means
+  nothing was pending (normal for `--no-apply`); `SYNCED` means rows were written ("Rows written").
+
 ## SAFE and AUTO
 
 | | SAFE (default) | AUTO |
@@ -144,6 +167,20 @@ handoff. The pipeline runs the Agent's own stage scripts (`AI_AGENT_STAGES`, def
 - `JOB_SOURCES=naukri` (the pipeline never triggers a paid LinkedIn/Apify scrape)
 - every key from **this** project's `.env` removed, so the Agent uses its own `.env` (python-dotenv
   never overrides existing variables, so e.g. our `GEMINI_API_KEY` would otherwise leak into it)
+
+**Scoped runs.** The Agent may score and tailor only the jobs this run exported. Next to the export the
+pipeline writes `agent_job_scope.json` (`{"run_id", "jobs": [{"id": <Naukri job id>, "link"}]}`) and
+passes it to the Agent's `score_jobs.py` and `tailor_job.py` as `--job-ids-file` (Agent:
+`scripts/job_scope.py`, see its `docs/RUNBOOK.md`). The Agent's cached LinkedIn jobs and older jobs are
+not scored or tailored in these runs, and its history is not rewritten. The run is refused before any
+stage starts -- never retried unscoped -- if the Agent has no `scripts/job_scope.py`, if
+`AI_AGENT_STAGES` contains a stage other than `scrape_jobs.py`, `score_jobs.py`, `tailor_job.py`, or if
+the scope file is missing. Nothing exported -> the Agent is not run at all.
+
+**Cost control.** `AI_AGENT_EXPORT_LIMIT` (default 2; not a whole number -> 2, below 1 -> 1, shown by
+`--check-config`) caps the jobs sent per run; each can cost a scoring and a tailoring LLM call. A low cap
+keeps LLM use small but fresh jobs can pass the 24-hour window while deferred, and then they are never
+scored; a higher cap scores more of them at more LLM cost. Nothing is ever sent beyond the cap.
 
 Only fresh, never-applied, unscored jobs are exported (up to `AI_AGENT_EXPORT_LIMIT`). Scores keep the
 Phase 2 mapping (1-10: 8+ recommended, 6-7 review, else skipped) and applications need
