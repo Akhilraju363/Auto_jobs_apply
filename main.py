@@ -310,6 +310,10 @@ def print_scan_summary(result: ScanResult) -> None:
     print(f"New jobs stored: {result.new_jobs_stored}")
     print(f"Duplicates skipped: {result.duplicates_skipped}")
     print(f"Failed job pages: {result.failed_job_pages}")
+    print(f"  (no readable description, retried next scan: {result.description_missing})")
+    print(f"Searches (keyword x location): {result.searches}")
+    print(f"Skipped before opening - older than the freshness window: {result.skipped_stale}")
+    print(f"Skipped before opening - experience minimum above the resume: {result.skipped_experience}")
     if result.stopped_reason:
         print(f"\nStopped early: {result.stopped_reason}")
     status = "SCAN STOPPED" if result.stopped_reason else "SCAN COMPLETE"

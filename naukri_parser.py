@@ -192,9 +192,12 @@ def make_dedup_key(
 
 
 def build_search_url(
-    keyword: str, location: Optional[str] = None, experience: Optional[int] = None, page: int = 1
+    keyword: str, location: Optional[str] = None, experience: Optional[int] = None, page: int = 1,
+    job_age: Optional[int] = None,
 ) -> str:
     """Naukri SEO search URL, e.g. /java-developer-jobs-in-pune-2?k=Java+Developer&experience=3.
+
+    job_age: Naukri's freshness filter (jobAge=N, posted in the last N days); None/0 omits it.
 
     Location goes only in the slug: adding an ``l=`` parameter that doesn't match
     Naukri's canonical city slug makes it redirect and drop the page number and
@@ -209,6 +212,8 @@ def build_search_url(
     params = [f"k={quote_plus(keyword.strip())}"]
     if experience is not None:
         params.append(f"experience={int(experience)}")
+    if job_age:
+        params.append(f"jobAge={int(job_age)}")
     return f"{NAUKRI_HOME}/{slug}?{'&'.join(params)}"
 
 
@@ -290,6 +295,21 @@ def parse_salary(text: Any) -> tuple[Optional[int], Optional[int]]:
 
 
 _RELATIVE_DAYS = re.compile(r"(\d+)\s*days?\s*ago")
+
+
+def parse_posted_timestamp(value: Any) -> Optional[str]:
+    """ISO timestamp when the value is an exact, timezone-aware date-time (JSON-LD datePosted such as
+    "2026-10-12T09:15:00+05:30" or "...Z"); None for a bare date or anything ambiguous."""
+    raw = str(value or "").strip()
+    if "T" not in raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.isoformat(timespec="seconds")
 
 
 def parse_posted_date(text: Any, today: Optional[date] = None) -> Optional[str]:
@@ -516,6 +536,10 @@ def merge_detail(job: NaukriJob, detail: dict, today: Optional[date] = None) -> 
     )
 
     posted_iso = parse_posted_date(posting.get("datePosted"), today)
+    # Kept as evidence only: the scanner uses it to settle a label that alone is ambiguous ("1 day ago").
+    exact_posted = parse_posted_timestamp(posting.get("datePosted"))
+    if exact_posted:
+        job.metadata["date_posted_exact"] = exact_posted
     posted_label = details.get("Posted") or job.posted_label
     job.posted_label = posted_label
     job.posted_date = posted_iso or parse_posted_date(posted_label, today) or job.posted_date
@@ -562,5 +586,6 @@ __all__ = [
     "parse_cards",
     "parse_experience",
     "parse_posted_date",
+    "parse_posted_timestamp",
     "parse_salary",
 ]

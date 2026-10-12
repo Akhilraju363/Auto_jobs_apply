@@ -55,18 +55,29 @@ def _env_list(name: str, default: list[str]) -> list[str]:
 
 
 # Naukri Phase 1 job discovery (override any of these in .env)
+# Searched in this order; the per-scan job budget fills from the first keywords first.
 DEFAULT_NAUKRI_KEYWORDS = [
-    "Java Full Stack Developer",
     "Java Developer",
-    "Full Stack Developer",
-    "Software Engineer",
     "Java Spring Boot Developer",
     "Java Backend Developer",
+    "Java Full Stack Developer",
+    "Full Stack Developer",
+    "Software Engineer",
 ]
+# Preferred search cities, searched before anything else (then PREFERRED_LOCATIONS, then all of India).
+DEFAULT_NAUKRI_LOCATIONS = ["Bengaluru", "Chennai"]
 
 NAUKRI_ENABLED = _env_bool("NAUKRI_ENABLED", True)
 NAUKRI_KEYWORDS = _env_list("NAUKRI_KEYWORDS", DEFAULT_NAUKRI_KEYWORDS)
 NAUKRI_LOCATION = os.getenv("NAUKRI_LOCATION", "").strip()
+NAUKRI_LOCATIONS = _env_list("NAUKRI_LOCATIONS", DEFAULT_NAUKRI_LOCATIONS)
+# After the preferred cities, one location-free pass per keyword so jobs elsewhere are still found.
+NAUKRI_SEARCH_ALL_LOCATIONS = _env_bool("NAUKRI_SEARCH_ALL_LOCATIONS", True)
+# Naukri's own "posted in the last N days" search filter (jobAge); 0 disables it. The 24-hour
+# freshness rule is still applied to every job afterwards; this only stops old results using the budget.
+NAUKRI_JOB_AGE_DAYS = max(0, _env_number("NAUKRI_JOB_AGE_DAYS", 1))
+# Total search-result pages per scan across all keyword/location searches (bounds page loads).
+NAUKRI_MAX_SEARCH_PAGES = max(1, _env_number("NAUKRI_MAX_SEARCH_PAGES", 30))
 NAUKRI_EXPERIENCE = _env_number("NAUKRI_EXPERIENCE", None)
 NAUKRI_MAX_PAGES = max(1, _env_number("NAUKRI_MAX_PAGES", 5))
 NAUKRI_MAX_JOBS = max(1, _env_number("NAUKRI_MAX_JOBS", 50))
@@ -146,6 +157,10 @@ __all__ = [
     "NAUKRI_ENABLED",
     "NAUKRI_KEYWORDS",
     "NAUKRI_LOCATION",
+    "NAUKRI_LOCATIONS",
+    "NAUKRI_SEARCH_ALL_LOCATIONS",
+    "NAUKRI_JOB_AGE_DAYS",
+    "NAUKRI_MAX_SEARCH_PAGES",
     "NAUKRI_EXPERIENCE",
     "NAUKRI_MAX_PAGES",
     "NAUKRI_MAX_JOBS",

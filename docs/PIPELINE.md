@@ -69,7 +69,27 @@ Only jobs posted/updated within `APPLICATION_JOB_WINDOW_HOURS` (default 24) are 
 Exact timestamps win. A relative label such as "5 hours ago" describes the moment of the scan, so it is
 aged by the time since `scraped_at`: a job read as "Today" three days ago is STALE now (before Phase 4
 such a job stayed FRESH forever). Ambiguous labels such as "1 day ago" are UNKNOWN, never fresh.
-`found_at` / `first_seen_at` are never used as freshness.
+`found_at` / `first_seen_at` are never used as freshness. "N weeks/months ago" and "30+ days ago"
+are STALE. An exact, timezone-aware JSON-LD `datePosted` is recorded and used only to settle a label
+that is ambiguous on its own ("1 day ago"); it never overrides a clear label (a reposted job keeps its
+"Just now").
+
+## Discovery
+
+The scanner searches each keyword (`NAUKRI_KEYWORDS`, Java roles first) in the preferred cities
+(`NAUKRI_LOCATIONS`, default Bengaluru then Chennai, then `NAUKRI_LOCATION` and `PREFERRED_LOCATIONS`),
+then once without a location (`NAUKRI_SEARCH_ALL_LOCATIONS`), so the per-scan job budget
+(`NAUKRI_MAX_JOBS`) fills in that priority. Searches use Naukri's `jobAge` filter
+(`NAUKRI_JOB_AGE_DAYS`, default 1) and stop after `NAUKRI_MAX_SEARCH_PAGES` result pages in total.
+
+Before a job page is opened, its search card is checked: a label already older than the window, or a
+Naukri experience minimum above the resume's verified years, is skipped and does not use the budget.
+Ambiguous freshness, missing or conflicting experience are opened and decided on the full job; the
+full-job experience check is stored when the job is saved.
+
+A job page whose description is empty is read again after waiting for the description element, then
+once more after one reload. If it is still empty the job is not stored (the next scan retries it) and
+the run reports it; a stored job with an empty description is `REVIEW_REQUIRED`, never eligible.
 
 ## Experience eligibility
 

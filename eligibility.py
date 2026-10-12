@@ -16,7 +16,10 @@ STALE = "STALE"
 UNKNOWN = "UNKNOWN"
 
 _RELATIVE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(minute|min|hour|hr)s?\s*ago\s*$", re.I)
-_DAY = re.compile(r"^\s*(\d+)\s*day[s]?\s*ago\s*$", re.I)
+_DAY = re.compile(r"^\s*(\d+)\s*(\+)?\s*day[s]?\s*ago\s*$", re.I)
+# "2 weeks ago", "3+ weeks ago", "1 month ago": always older than any window this project allows.
+_WEEK_OR_MONTH = re.compile(r"^\s*(\d+)\s*\+?\s*(week|month)s?\s*ago\s*$", re.I)
+_HOURS_PER = {"week": 168, "month": 720}
 _ALIASES = {
     "bangalore": "bangalore", "bengaluru": "bangalore",
     "chennai": "chennai",
@@ -68,7 +71,13 @@ def freshness_for(
     if day:
         # Naukri's "1 day ago" has no exact hour and must not be treated as 24 hours.
         age = float(day.group(1)) * 24
+        if day.group(2):  # "30+ days ago": at least that old
+            return (STALE if age >= window_hours else UNKNOWN), age
         return (UNKNOWN if age == 24 else (FRESH if age < window_hours else STALE)), age
+    older = _WEEK_OR_MONTH.match(text)
+    if older:
+        age = float(older.group(1)) * _HOURS_PER[older.group(2).lower()]
+        return (STALE if age >= window_hours else UNKNOWN), age
     return UNKNOWN, None
 
 

@@ -15,16 +15,22 @@ from typing import Callable, Optional
 from playwright.sync_api import BrowserContext, Error as PlaywrightError, Page, Playwright, sync_playwright
 
 from config import (
+    APPLICATION_JOB_WINDOW_HOURS,
     CHROME_USER_DATA,
     NAUKRI_DELAY_MAX,
     NAUKRI_DELAY_MIN,
     NAUKRI_EXPERIENCE,
+    NAUKRI_JOB_AGE_DAYS,
     NAUKRI_KEYWORDS,
     NAUKRI_LOCATION,
+    NAUKRI_LOCATIONS,
     NAUKRI_MAX_JOBS,
     NAUKRI_MAX_PAGES,
+    NAUKRI_MAX_SEARCH_PAGES,
+    NAUKRI_SEARCH_ALL_LOCATIONS,
+    PREFERRED_LOCATIONS,
 )
-from db import init_db, is_job_applied, job_exists, save_discovered_job
+from db import find_job_row_id, get_job, init_db, is_job_applied, job_exists, save_discovered_job
 from naukri_parser import (
     NaukriJob,
     build_search_url,
@@ -34,7 +40,8 @@ from naukri_parser import (
     next_page_url,
     parse_cards,
 )
-from eligibility import freshness_for
+from eligibility import STALE, UNKNOWN, freshness_for, normalize_preferred_location
+from experience_check import INELIGIBLE, check_experience, record_experience_check, verified_resume_experience
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +55,15 @@ CARD_SELECTORS = ("div.srp-jobtuple-wrapper", "div.cust-job-tuple", "article.job
 DETAIL_READY_SELECTOR = (
     "[class*='jd-header-title'], [class*='job-desc'], .jobDesc, script[type='application/ld+json']"
 )
+# The description itself. JSON-LD and the header often attach before the description is rendered,
+# so an empty first read waits for this before reading again.
+DESCRIPTION_SELECTOR = (
+    "[class*='dang-inner-html'], [class*='job-desc-container'], section[class*='job-desc'], "
+    "[class*='JDC__'], .jobDesc, .job-desc"
+)
+DESCRIPTION_RETRY_WAIT_SECONDS = 2.0
+
+_FROM_MASTER_RESUME = object()  # NaukriScanner default: verified experience from MASTER_RESUME_PATH
 
 # Runs inside the page against one card element; returns raw strings only.
 CARD_EXTRACT_JS = """
@@ -99,7 +115,8 @@ DETAIL_EXTRACT_JS = """
     experience: text(["[class*='jhc__exp']", '.exp']),
     salary: text(["[class*='jhc__salary']", '.salary']),
     work_mode: text(["[class*='jhc__wfhmode']"]),
-    description: text(["[class*='dang-inner-html']", "[class*='job-desc-container']", '.jobDesc', '.job-desc']),
+    description: text(["[class*='dang-inner-html']", "[class*='job-desc-container']", "section[class*='job-desc']",
+                       "[class*='JDC__']", '.jobDesc', '.job-desc']),
     skills: Array.from(skillNodes).map(n => (n.innerText || '').trim()).filter(Boolean),
     details: details,
     buttons: buttons,
@@ -113,6 +130,10 @@ class ScanStopped(Exception):
     """Raised when the scan must stop: login wall, CAPTCHA or block page."""
 
 
+class DescriptionMissing(ValueError):
+    """The job page loaded but no description could be read, even after waiting and one reload."""
+
+
 @dataclass
 class ScanResult:
     keywords: list[str]
@@ -123,6 +144,10 @@ class ScanResult:
     new_jobs_stored: int = 0
     duplicates_skipped: int = 0
     failed_job_pages: int = 0
+    searches: int = 0  # keyword/location searches started
+    skipped_stale: int = 0  # search cards already older than the freshness window (no detail page opened)
+    skipped_experience: int = 0  # search cards whose Naukri experience minimum exceeds the resume
+    description_missing: int = 0  # detail pages without a readable description (not stored; retried next scan)
     stopped_reason: Optional[str] = None
     jobs: list[NaukriJob] = field(default_factory=list)
 
@@ -167,11 +192,35 @@ class NaukriScanner:
         max_jobs: Optional[int] = None,
         delay_range: Optional[tuple[float, float]] = None,
         sleep: Callable[[float], None] = time.sleep,
+        locations: Optional[list[str]] = None,
+        search_all_locations: Optional[bool] = None,
+        job_age_days: Optional[int] = None,
+        max_search_pages: Optional[int] = None,
+        verified_experience=_FROM_MASTER_RESUME,
+        window_hours: int = APPLICATION_JOB_WINDOW_HOURS,
     ):
+        """location: one explicit search location (the pre-existing single-location mode).
+        locations: searched in order; default NAUKRI_LOCATIONS, then NAUKRI_LOCATION, then PREFERRED_LOCATIONS.
+        search_all_locations: finish with one location-free search per keyword (default
+        NAUKRI_SEARCH_ALL_LOCATIONS; off when an explicit location is given)."""
         self.page = page
         self.headless = headless
         self.keywords = keywords or list(NAUKRI_KEYWORDS)
         self.location = location if location is not None else NAUKRI_LOCATION
+        if location is not None:
+            self.locations = [location] if location else []
+            self.search_all_locations = not location if search_all_locations is None else search_all_locations
+        else:
+            configured = list(locations) if locations is not None else (
+                list(NAUKRI_LOCATIONS) + [NAUKRI_LOCATION] + list(PREFERRED_LOCATIONS))
+            self.locations = _search_locations(configured)
+            self.search_all_locations = (NAUKRI_SEARCH_ALL_LOCATIONS if search_all_locations is None
+                                         else search_all_locations)
+        self.job_age_days = NAUKRI_JOB_AGE_DAYS if job_age_days is None else job_age_days
+        self.max_search_pages = max_search_pages or NAUKRI_MAX_SEARCH_PAGES
+        self.verified_experience = (verified_resume_experience() if verified_experience is _FROM_MASTER_RESUME
+                                    else verified_experience)
+        self.window_hours = window_hours
         self.experience = experience if experience is not None else NAUKRI_EXPERIENCE
         self.max_pages = max_pages or NAUKRI_MAX_PAGES
         self.max_jobs = max_jobs or NAUKRI_MAX_JOBS
@@ -220,7 +269,8 @@ class NaukriScanner:
         init_db()
         result = ScanResult(keywords=list(self.keywords))
         logger.info(
-            f"Naukri scanner started | keywords={self.keywords} | location={self.location or '-'} | "
+            f"Naukri scanner started | keywords={self.keywords} | locations={self.locations or '-'}"
+            f"{' + all India' if self.search_all_locations else ''} | jobAge={self.job_age_days or '-'} | "
             f"experience={self.experience if self.experience is not None else '-'} | "
             f"max_pages={self.max_pages} | max_jobs={self.max_jobs}"
         )
@@ -234,43 +284,94 @@ class NaukriScanner:
         logger.info(f"Naukri scan completed: {result.summary()}")
         return result
 
+    def search_queries(self) -> list[tuple[str, Optional[str]]]:
+        """(keyword, location) in priority order: every keyword in each preferred location first,
+        then (optionally) every keyword without a location. The job budget fills in this order."""
+        queries = [(keyword, location) for keyword in self.keywords for location in self.locations]
+        if self.search_all_locations or not self.locations:
+            queries += [(keyword, None) for keyword in self.keywords]
+        return queries
+
     def search_jobs(self, result: Optional[ScanResult] = None) -> list[NaukriJob]:
-        """Walk search pages for every keyword; return unique jobs not already in the database."""
+        """Walk search pages for every query; return unique jobs not already in the database that
+        passed the search-card checks (not stale, experience minimum not above the resume)."""
         result = result or ScanResult(keywords=list(self.keywords))
         seen_keys: set[str] = set()
         candidates: list[NaukriJob] = []
-        for keyword in self.keywords:
-            if len(candidates) >= self.max_jobs:
+        for keyword, location in self.search_queries():
+            if len(candidates) >= self.max_jobs or result.pages_scanned >= self.max_search_pages:
                 break
-            logger.info(f"Searching Naukri for: {keyword}")
-            self._search_keyword(keyword, seen_keys, candidates, result)
+            logger.info(f"Searching Naukri for: {keyword} | {location or 'all locations'}")
+            result.searches += 1
+            self._search_keyword(keyword, seen_keys, candidates, result, location)
         result.unique_jobs = len(seen_keys)
         return candidates
 
     def fetch_job_details(self, job: NaukriJob) -> NaukriJob:
+        """Open the job page and merge its details. An empty description is read again after waiting
+        for the description element, then once more after one reload; still empty -> DescriptionMissing
+        (the job is not stored, so the next scan tries it again). Never filled in from anything else."""
         self._navigate(job.url)
+        self._wait_for(DETAIL_READY_SELECTOR, job)
+        self._read_detail(job)
+        if not job.job_description:
+            logger.info(f"Description not rendered yet; waiting for it: {job.url}")
+            self._wait_for(DESCRIPTION_SELECTOR, job)
+            self._scroll_and_wait()
+            self._read_detail(job)
+        if not job.job_description:
+            logger.info(f"Description still missing; reloading once: {job.url}")
+            self._navigate(job.url)
+            self._wait_for(DESCRIPTION_SELECTOR, job)
+            self._read_detail(job)
+        if not job.job_description:
+            raise DescriptionMissing("job description not found on detail page (after waiting and one reload)")
+        return job
+
+    def _wait_for(self, selector: str, job: NaukriJob) -> None:
         try:
-            self.page.wait_for_selector(DETAIL_READY_SELECTOR, timeout=CONTENT_TIMEOUT_MS, state="attached")
+            self.page.wait_for_selector(selector, timeout=CONTENT_TIMEOUT_MS, state="attached")
         except PlaywrightError:
             self._check_page_state()
             logger.warning(f"Timeout waiting for job detail content: {job.url}")
+
+    def _read_detail(self, job: NaukriJob) -> None:
         self._check_page_state()
-        detail = self.page.evaluate(DETAIL_EXTRACT_JS)
-        merge_detail(job, detail)
-        if not job.job_description:
-            raise ValueError("job description not found on detail page")
-        return job
+        merge_detail(job, self.page.evaluate(DETAIL_EXTRACT_JS))
+
+    def _scroll_and_wait(self) -> None:
+        try:  # some layouts render the description lazily, once it is near the viewport
+            self.page.evaluate("() => window.scrollTo(0, document.body ? document.body.scrollHeight / 2 : 0)")
+        except PlaywrightError:
+            pass
+        self._sleep(DESCRIPTION_RETRY_WAIT_SECONDS)
+
+    def card_skip_reason(self, job: NaukriJob, reference_time: datetime) -> Optional[str]:
+        """Why a search card is not worth opening, or None. Only definite answers skip: a label that
+        is already older than the window (an ambiguous one such as "1 day ago" is opened, its page may
+        say more), or Naukri's own experience minimum above the verified resume experience. Missing,
+        conflicting or unclear requirements are opened and decided on the full job."""
+        status, _ = freshness_for(job.posted_label, reference_time=reference_time, window_hours=self.window_hours)
+        if status == STALE:
+            return "stale"
+        card = {"title": job.title, "experience_min": job.experience_min, "experience_max": job.experience_max,
+                "experience_text": job.experience_text}
+        check = check_experience(card, self.verified_experience)
+        if check.status == INELIGIBLE:
+            return check.reason
+        return None
 
     # -- internals ------------------------------------------------------
 
     def _search_keyword(
-        self, keyword: str, seen_keys: set[str], candidates: list[NaukriJob], result: ScanResult
+        self, keyword: str, seen_keys: set[str], candidates: list[NaukriJob], result: ScanResult,
+        location: Optional[str] = None,
     ) -> None:
         page_signatures: set[frozenset] = set()
-        search_url = build_search_url(keyword, self.location, self.experience)
+        search_url = build_search_url(keyword, location, self.experience, job_age=self.job_age_days)
         url = search_url
         for page_number in range(1, self.max_pages + 1):
-            if len(candidates) >= self.max_jobs:
+            if len(candidates) >= self.max_jobs or result.pages_scanned >= self.max_search_pages:
                 return
             logger.info(f"Scanning page {page_number} for '{keyword}': {url}")
             try:
@@ -303,6 +404,7 @@ class NaukriScanner:
         self, jobs: list[NaukriJob], seen_keys: set[str], candidates: list[NaukriJob], result: ScanResult
     ) -> int:
         unseen = 0
+        now = datetime.now(timezone.utc)
         for job in jobs:
             key = job.dedup_key
             if key in seen_keys:
@@ -317,6 +419,16 @@ class NaukriScanner:
                 continue
             if len(candidates) >= self.max_jobs:
                 continue
+            skip = self.card_skip_reason(job, now)
+            if skip == "stale":
+                result.skipped_stale += 1
+                logger.info(f"Skipped (posted {job.posted_label}, older than {self.window_hours}h): "
+                            f"{job.title} @ {job.company}")
+                continue
+            if skip:
+                result.skipped_experience += 1
+                logger.info(f"{skip} | {job.title} @ {job.company}")
+                continue
             candidates.append(job)
             logger.info(f"Job discovered: {job.title} @ {job.company} [{job.job_id or job.url}]")
         return unseen
@@ -327,15 +439,25 @@ class NaukriScanner:
                 self.fetch_job_details(job)
             except ScanStopped:
                 raise
+            except DescriptionMissing as e:
+                result.failed_job_pages += 1
+                result.description_missing += 1
+                logger.warning(f"Not stored (retried next scan): {job.url}: {e}")
+                continue
             except Exception as e:
                 result.failed_job_pages += 1
                 logger.warning(f"Job detail extraction failed for {job.url}: {e}")
                 continue
             if job.job_id and is_job_applied(job.job_id):
                 job.is_already_applied = True
-            job.freshness_status, _ = freshness_for(
-                job.posted_label, reference_time=datetime.now(timezone.utc)
-            )
+            now = datetime.now(timezone.utc)
+            job.freshness_status, _ = freshness_for(job.posted_label, reference_time=now, window_hours=self.window_hours)
+            exact = job.metadata.get("date_posted_exact")
+            if job.freshness_status == UNKNOWN and exact:
+                # The label alone is ambiguous ("1 day ago"); the page's exact timestamp settles it.
+                job.posted_at = exact
+                job.freshness_status, _ = freshness_for(reference_time=now, posted_at=exact,
+                                                        window_hours=self.window_hours)
             job.freshness_checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             try:
                 stored = save_discovered_job(job.to_dict())
@@ -346,9 +468,22 @@ class NaukriScanner:
                 result.new_jobs_stored += 1
                 result.jobs.append(job)
                 logger.info(f"Job stored: {job.title} @ {job.company}")
+                self._record_experience(job)
             else:
                 result.duplicates_skipped += 1
                 logger.info(f"Duplicate skipped: {job.title} @ {job.company}")
+
+    def _record_experience(self, job: NaukriJob) -> None:
+        """Store the full-job experience check (with the description) on the new row right away."""
+        try:
+            row_id = find_job_row_id(job.dedup_key, job.job_id, job.url)
+            row = get_job(row_id) if row_id is not None else None
+            if row is not None:
+                check = record_experience_check(row, self.verified_experience)
+                if check.status != "ELIGIBLE":
+                    logger.info(f"{check.reason} | {job.title} @ {job.company}")
+        except Exception as e:  # noqa: BLE001 -- the pipeline checks again before export
+            logger.warning(f"Experience check not stored for {job.url}: {e}")
 
     def _navigate(self, url: str) -> None:
         if self._navigations:
@@ -406,12 +541,27 @@ class NaukriScanner:
             )
 
 
+def _search_locations(values: list[str]) -> list[str]:
+    """Configured search cities in order, without blanks, duplicates ("Bangalore" = "Bengaluru") or
+    remote/WFH (not a city slug on Naukri; remote jobs come from the location-free search)."""
+    seen, ordered = set(), []
+    for value in values:
+        name = str(value or "").strip()
+        key = normalize_preferred_location(name)
+        if not name or key in seen or key == "remote":
+            continue
+        seen.add(key)
+        ordered.append(name)
+    return ordered
+
+
 __all__ = [
     "CARD_EXTRACT_JS",
     "CARD_SELECTORS",
     "NaukriScanner",
     "ScanResult",
     "ScanStopped",
+    "DescriptionMissing",
     "find_card_handles",
     "launch_browser_context",
 ]

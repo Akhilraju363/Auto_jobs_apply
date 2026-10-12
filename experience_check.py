@@ -204,6 +204,11 @@ def check_experience(job: Mapping, verified: Optional[VerifiedExperience]) -> Ex
     if len(above) == len(requirements):
         lowest = min(above, key=lambda r: r.min_years)
         return result(INELIGIBLE, f"Skipped: JD requires {lowest.text}; {supports}.", lowest.text, lowest.min_years)
+    if "job_description" in job and not str(job.get("job_description") or "").strip():
+        # The description was looked for and is empty: its requirements were never seen, so a passing
+        # Naukri field alone is not enough. (A dict without the key, e.g. a search card, is not affected.)
+        return result(REVIEW_REQUIRED, f"Review required: the job description could not be loaded, so its "
+                                       f"experience requirement is unverified; {supports}.")
     if above:
         listed = ", ".join(dict.fromkeys(r.text for r in requirements))
         strictest = max(above, key=lambda r: r.min_years)

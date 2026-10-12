@@ -264,6 +264,13 @@ def _find_job_row_id(
     return row[0] if row else None
 
 
+def find_job_row_id(dedup_key: str, job_id: Optional[str] = None, url: Optional[str] = None,
+                    source: str = "naukri") -> Optional[int]:
+    """jobs.id of a stored job (same identity rules as job_exists), or None."""
+    with sqlite3.connect(DB_PATH) as conn:
+        return _find_job_row_id(conn, dedup_key, job_id, url, source)
+
+
 def job_exists(
     dedup_key: str, job_id: Optional[str] = None, url: Optional[str] = None, source: str = "naukri"
 ) -> bool:

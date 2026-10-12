@@ -138,7 +138,9 @@ class TestScannerFlow(TempDbTestCase):
         }
 
     def scanner(self, **kwargs):
-        options = dict(keywords=["Java Developer", "Software Engineer"], max_pages=10, max_jobs=50, location="")
+        # pagination/dedupe only: no jobAge filter in the URLs (covered by test_scanner_discovery.py)
+        options = dict(keywords=["Java Developer", "Software Engineer"], max_pages=10, max_jobs=50, location="",
+                       job_age_days=0)
         options.update(kwargs)
         return FakeScanner(self.pages, self.next_links, **options)
 
