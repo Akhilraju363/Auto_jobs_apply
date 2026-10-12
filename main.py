@@ -50,7 +50,7 @@ from naukri_application import (
 from resume_artifact import resolve_verified_resume
 from hitl_engine import HITLEngine
 from eligibility import evaluate_job, priority_score, FRESH
-from application_profile import ApplicationProfile
+from experience_check import ELIGIBLE, record_experience_check, verified_resume_experience
 
 logging.basicConfig(
     level=logging.INFO,
@@ -318,10 +318,22 @@ def print_scan_summary(result: ScanResult) -> None:
 
 def run_export_to_agent(limit: Optional[int]) -> None:
     """Phase 2: write discovered jobs to the AI Agent handoff file (does not run the Agent)."""
-    result = export_discovered_jobs(limit=limit)
+    verified = verified_resume_experience()
+    rejected = []
+
+    def experience_ok(job: dict) -> bool:  # strict experience check before the AI Agent spends any calls
+        check = record_experience_check(job, verified)
+        if check.status != ELIGIBLE:
+            rejected.append(f"[{job['id']}] {job.get('title') or '?'} @ {job.get('company') or '?'}: {check.reason}")
+        return check.status == ELIGIBLE
+
+    result = export_discovered_jobs(limit=limit, job_filter=experience_ok)
     line = "=" * 40
     print(f"\n{line}\nNAUKRI -> AI AGENT EXPORT\n{line}\n")
     print(f"Discovered jobs: {result.discovered}")
+    print(f"Experience check failed (not exported): {len(rejected)}")
+    for line_ in rejected:
+        print(f"  - {line_}")
     print(f"Eligible jobs: {result.eligible}")
     print(f"  (descriptions supplemented with Naukri key skills: {result.supplemented})")
     print(f"Skipped short/invalid jobs: {len(result.skipped)}")
@@ -360,18 +372,11 @@ def _candidate_view(job: dict, include_review: bool = False) -> Optional[tuple[d
     if not include_review and job.get("match_status") != "recommended":
         return None
     artifact, _, _ = resolve_verified_resume(job["url"], AI_AGENT_OUTPUT_DIR)
-    raw_experience = ApplicationProfile.from_environment().total_experience
-    applicant_experience = None
-    if raw_experience:
-        try:
-            applicant_experience = float(raw_experience.split()[0])
-        except (ValueError, IndexError):
-            applicant_experience = None
     result = evaluate_job(
         job,
         reference_time=datetime.now(timezone.utc),
         preferred_locations=PREFERRED_LOCATIONS,
-        applicant_experience=applicant_experience,
+        applicant_experience=verified_resume_experience(),  # the master resume, never inflated
         score_threshold=APPLICATION_SCORE_THRESHOLD,
         resume_ready=artifact is not None and artifact.verified,
         window_hours=APPLICATION_JOB_WINDOW_HOURS,
@@ -396,7 +401,7 @@ def run_application_candidates(include_review: bool) -> None:
         print(f"{job['title']}\nCompany: {job['company']}")
         print(f"Location: {job.get('location') or '-'} | Location match: "
               f"{'YES' if result.location_match is True else 'UNKNOWN'}")
-        print(f"Experience match: {'YES' if result.experience_match is True else 'UNKNOWN'}")
+        print(f"Experience: {result.experience_status} - {result.experience_reason}")
         print("Resume: VERIFIED" if result.resume_ready else "Resume: NOT READY")
         print(f"Application state: {job.get('application_state') or 'READY'}")
     print(f"\nCandidates: {len(candidates)}")

@@ -91,6 +91,16 @@ APPLICATION_COLUMNS = {
     "application_updated_at": "TIMESTAMP",
     "external_apply_url": "TEXT",
 }
+# Strict experience eligibility (experience_check.py), written before scoring/tailoring.
+EXPERIENCE_CHECK_COLUMNS = {
+    "experience_required": "TEXT",  # the JD requirement as shown, e.g. "5–8 years"
+    "experience_required_min": "REAL",  # the minimum years it was compared by
+    "experience_verified": "TEXT",  # what the master resume supports, e.g. "4+ years"
+    "experience_verified_years": "REAL",
+    "experience_check_status": "TEXT",  # ELIGIBLE / INELIGIBLE / REVIEW_REQUIRED
+    "experience_check_reason": "TEXT",  # e.g. "Skipped: JD requires 5–8 years; resume supports 4+ years."
+    "experience_checked_at": "TIMESTAMP",
+}
 # Extra application-history fields on applied_jobs (added in place, existing rows keep NULL).
 APPLIED_JOBS_EXTRA_COLUMNS = {
     "job_row_id": "INTEGER",
@@ -164,7 +174,7 @@ def _init_jobs_table(conn: sqlite3.Connection) -> None:
         """
     )
     existing = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
-    for name, declaration in {**JOB_COLUMNS, **SCORING_COLUMNS, **APPLICATION_COLUMNS}.items():
+    for name, declaration in {**JOB_COLUMNS, **SCORING_COLUMNS, **APPLICATION_COLUMNS, **EXPERIENCE_CHECK_COLUMNS}.items():
         if name not in existing:
             try:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {declaration}")
@@ -369,6 +379,23 @@ def save_job_score(
                 datetime.now().isoformat(timespec="seconds"),
                 job_row_id,
             ),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def save_experience_check(job_row_id: int, check, checked_at: Optional[str] = None) -> bool:
+    """Store an experience_check.ExperienceCheck on the jobs row. Touches only the experience columns."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            """
+            UPDATE jobs SET experience_required = ?, experience_required_min = ?, experience_verified = ?,
+                experience_verified_years = ?, experience_check_status = ?, experience_check_reason = ?,
+                experience_checked_at = ?
+            WHERE id = ?
+            """,
+            (check.required_text, check.required_min, check.verified_text, check.verified_years,
+             check.status, check.reason, checked_at or datetime.now().isoformat(timespec="seconds"), job_row_id),
         )
         conn.commit()
         return cursor.rowcount > 0

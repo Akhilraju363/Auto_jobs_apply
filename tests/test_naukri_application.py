@@ -85,12 +85,21 @@ class Phase3TestCase(unittest.TestCase):
         db.init_db()
         self.agent_out = self.tmp / "agent_output"
         self.make_resume()
+        # The runner's experience guard reads the master resume; use a fixed 4+ years one.
+        self.master_resume = self.tmp / "base_resume.md"
+        self.master_resume.write_text("## Summary\nSoftware Engineer with 4+ years of experience in Java.\n",
+                                      encoding="utf-8")
+        patcher = mock.patch.object(app, "MASTER_RESUME_PATH", self.master_resume)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def add_job(self, job_id="900000000001", score=80.0, match_status="recommended", scored=True, url=None, **extra):
         card = {"job_id": job_id, "url": url or JOB_URL.replace("900000000001", job_id),
                 "title": "Java Full Stack Developer", "company": "Infosys", "location": "Hyderabad"}
         job = parse_card(card).to_dict()
         job["job_description"] = "Spring Boot and Angular " * 10
+        # Naukri's structured experience field; 3-5 years is within the resume's verified 4+ years.
+        job.update(experience_min=3, experience_max=5, experience_text="3 - 5 years")
         job.update(extra)
         db.save_discovered_job(job)
         row = next(j for j in db.get_jobs(status=None) if j["job_id"] == job_id)

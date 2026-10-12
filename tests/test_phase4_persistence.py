@@ -409,10 +409,11 @@ class TestFreshnessAnchoring(unittest.TestCase):
                                        reference_time=self.REF)[0], UNKNOWN)
 
     def test_stale_label_blocks_eligibility(self):
-        base = dict(self.job("Just now", 30), match_score=90)
-        self.assertFalse(evaluate_job(base, reference_time=self.REF, preferred_locations=[]).eligible)
+        base = dict(self.job("Just now", 30), match_score=90, experience_min=3, experience_max=5)
+        self.assertFalse(evaluate_job(base, reference_time=self.REF, preferred_locations=[],
+                                      applicant_experience=4).eligible)
         self.assertTrue(evaluate_job(dict(base, **self.job("Just now", 2)), reference_time=self.REF,
-                                     preferred_locations=[]).eligible)
+                                     preferred_locations=[], applicant_experience=4).eligible)
 
 
 if __name__ == "__main__":

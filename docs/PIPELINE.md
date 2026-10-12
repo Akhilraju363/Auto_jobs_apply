@@ -20,6 +20,7 @@ start_local.bat
        3  scan Naukri                             naukri_scanner.NaukriScanner
        4  keep FRESH jobs (24h)                   eligibility.job_freshness
        5  drop already-applied jobs               db.has_successful_application
+     5b  experience check (before any LLM call)  experience_check.check_experience      -> INELIGIBLE / REVIEW_REQUIRED never exported
        6  export to the AI Agent                  ai_agent_bridge.export_discovered_jobs  -> exports/naukri_jobs.json
        7  run the AI Agent                        ai_agent_bridge.run_agent_stages        (its own scripts, own venv)
        8  import scores                           ai_agent_bridge.import_agent_scores     <- output/scored_jobs.json
@@ -69,6 +70,37 @@ Exact timestamps win. A relative label such as "5 hours ago" describes the momen
 aged by the time since `scraped_at`: a job read as "Today" three days ago is STALE now (before Phase 4
 such a job stayed FRESH forever). Ambiguous labels such as "1 day ago" are UNKNOWN, never fresh.
 `found_at` / `first_seen_at` are never used as freshness.
+
+## Experience eligibility
+
+The master ATS resume (`MASTER_RESUME_PATH`, default the AI Agent's `resume/base_resume.md`) is the only
+source of your experience. Its explicit claim ("4+ years of experience") is read as its floor, 4 years,
+and is never rounded up; `APPLICANT_TOTAL_EXPERIENCE` can only lower it.
+
+A job's requirement is Naukri's experience field ("5 - 8 years", authoritative) plus explicit mentions in
+the title and description ("3+ years of experience", "4 to 6 years", "Minimum 4 years"). Ranges are
+compared by their **minimum**.
+
+| Result | When | Effect |
+|---|---|---|
+| `ELIGIBLE` | every stated minimum <= verified years | the other checks continue |
+| `INELIGIBLE` | Naukri's minimum (or every stated minimum) > verified years | skipped: `Skipped: JD requires 5–8 years; resume supports 4+ years.` |
+| `REVIEW_REQUIRED` | no requirement found, sources conflict, or the resume states no experience | never applied |
+
+The check runs before export, so failing jobs cost no AI scoring/tailoring calls, and again at
+eligibility. `ApplicationRunner.process` enforces it once more on its own, whoever calls it: after the
+duplicate/recovery check and before the job page, resume, attempt log or Apply control is touched, it
+checks both the passed job and its stored row (the stricter wins). A refused job gets
+`application_state=not_ready` with `application_code` `EXPERIENCE_INELIGIBLE` or
+`EXPERIENCE_REVIEW_REQUIRED` (reported as SKIPPED); `applied_jobs` and final/recovery states are never
+touched, and any error in the check fails closed. The legacy `main.py --mode cli` drivers run the same
+check before clicking Apply. Results are stored on `jobs` (`experience_required`, `experience_required_min`,
+`experience_verified`, `experience_verified_years`, `experience_check_status`, `experience_check_reason`,
+`experience_checked_at`). Report without browsing, exporting, running the Agent, writing Sheets or applying:
+
+```bat
+python application_pipeline.py --eligibility-check
+```
 
 ## SAFE and AUTO
 

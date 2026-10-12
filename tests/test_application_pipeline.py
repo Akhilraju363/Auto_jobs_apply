@@ -69,7 +69,7 @@ class PipelineTestCase(Phase3TestCase):
                       export_limit=5, export_path=self.tmp / "exports" / "naukri_jobs.json", agent_dir=None,
                       agent_output_dir=self.agent_out, agent_python=None, agent_stages=["score_jobs.py"],
                       sheets_enabled=True, sheet_id="sheet-id", sheet_tab="Sheet1", chrome_profile=self.profile,
-                      naukri_enabled=True)
+                      naukri_enabled=True, master_resume_path=self.master_resume)
         values.update(overrides)
         return pipeline.PipelineSettings(**values)
 
