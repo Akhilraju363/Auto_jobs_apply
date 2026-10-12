@@ -77,17 +77,46 @@ def classify_gws_error(text: str) -> str:
     return AUTH_REQUIRED if any(marker in lowered for marker in _AUTH_MARKERS) else SYNC_FAILED
 
 
-def resolve_gws_command() -> list[str]:
-    """Same resolution as the AI Agent's write_sheet._resolve_gws(): on Windows call node with the
-    package's run.js directly, bypassing the .cmd shim."""
-    if os.name != "nt":
+# The npm package's real entry point, next to the gws / gws.cmd / gws.ps1 shims npm installs.
+_GWS_ENTRY = ("node_modules", "@googleworkspace", "cli", "run.js")
+# cmd.exe still interprets these inside a "\"-escaped argument, so they cannot pass through a .cmd shim.
+# ("!" is not listed: it is special only under delayed expansion, which the npm shim leaves off, and
+# every A1 range such as Sheet1!A:S contains it.)
+_CMD_UNSAFE = set('&|<>^%\r\n')
+
+
+def resolve_gws_command(which: Callable[[str], Optional[str]] = shutil.which,
+                        exists: Callable[[str], bool] = os.path.exists,
+                        environ: Optional[dict] = None, os_name: Optional[str] = None) -> list[str]:
+    """The argv prefix for `gws`, never through a shell.
+
+    Linux/macOS: ``gws`` (unchanged). Windows: ``<node> <npm>/node_modules/@googleworkspace/cli/run.js``,
+    so each JSON argument reaches gws exactly as built (an argument list, no PowerShell or cmd.exe
+    parsing -- Windows PowerShell 5.1 strips the inner quotes when it runs the gws.ps1 shim, which
+    gws then reports as "Invalid --params JSON"). The npm folder is found from any of the shims on
+    PATH or %APPDATA%\\npm; node is the shim's own node.exe if present, else node on PATH. Only if
+    run.js is missing is an explicitly resolved gws.cmd used (GwsClient refuses arguments cmd.exe
+    would misread). Never the PowerShell shim, never a bare ``gws`` Windows cannot launch."""
+    environ = os.environ if environ is None else environ
+    if (os_name or os.name) != "nt":
         return ["gws"]
-    gws_cmd = shutil.which("gws.cmd")
-    if gws_cmd:
-        run_js = os.path.join(os.path.dirname(gws_cmd), "node_modules", "@googleworkspace", "cli", "run.js")
-        if os.path.exists(run_js):
-            return ["node", run_js]
-    return ["gws"]
+    folders = []
+    for shim in ("gws.cmd", "gws.ps1", "gws"):
+        found = which(shim)
+        if found:
+            folders.append(os.path.dirname(found))
+    if environ.get("APPDATA"):
+        folders.append(os.path.join(environ["APPDATA"], "npm"))
+    for folder in dict.fromkeys(folders):
+        run_js = os.path.join(folder, *_GWS_ENTRY)
+        if not exists(run_js):
+            continue
+        local_node = os.path.join(folder, "node.exe")
+        node = local_node if exists(local_node) else which("node")
+        if node:
+            return [node, run_js]
+    gws_cmd = which("gws.cmd")
+    return [gws_cmd] if gws_cmd else ["gws.cmd"]  # not installed: GwsClient reports GWS_NOT_INSTALLED
 
 
 class GwsClient:
@@ -99,6 +128,12 @@ class GwsClient:
         self.runner, self.timeout = runner, timeout_seconds
 
     def __call__(self, *args: str) -> dict:
+        launcher = str(self.command[0]).lower()
+        if launcher.endswith((".cmd", ".bat")) and any(set(str(a)) & _CMD_UNSAFE for a in args):
+            # A .cmd shim runs under cmd.exe, which would reinterpret these characters (e.g. a company
+            # name with "&"): refuse instead of sending a mangled or split command.
+            raise SheetsError(SYNC_FAILED, "this value cannot be passed safely through gws.cmd; reinstall the "
+                                           "gws npm package so its run.js can be called directly")
         try:
             result = self.runner([*self.command, *args], capture_output=True, text=True, encoding="utf-8",
                                  timeout=self.timeout)
@@ -106,10 +141,15 @@ class GwsClient:
             raise SheetsError(GWS_NOT_INSTALLED, "the gws CLI is not installed (see the AI Agent's GWS_SETUP.md)")
         except subprocess.TimeoutExpired:
             raise SheetsError(SYNC_FAILED, f"gws did not answer within {self.timeout}s")
+        except OSError as e:  # e.g. WinError 193: a launcher Windows cannot execute directly
+            raise SheetsError(GWS_NOT_INSTALLED, f"gws could not be started ({type(e).__name__}: {e})")
         if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip().splitlines()
+            output = result.stderr or result.stdout or ""
+            detail = [line for line in output.strip().splitlines() if line.strip()]
             message = detail[-1][:200] if detail else f"exit code {result.returncode}"
-            raise SheetsError(classify_gws_error(result.stderr or result.stdout), f"gws {args[0]} failed: {message}")
+            if "invalid --params json" in output.lower() or "invalid --json" in output.lower():
+                message += " (the JSON argument was altered before reaching gws: call it through run.js, not a shell)"
+            raise SheetsError(classify_gws_error(output), f"gws {args[0]} failed: {message}")
         try:
             return json.loads(result.stdout) if (result.stdout or "").strip() else {}
         except json.JSONDecodeError:
