@@ -46,6 +46,7 @@ from config import (
     GOOGLE_SHEET_ID,
     GOOGLE_SHEET_TAB,
     GOOGLE_SHEETS_ENABLED,
+    MASTER_RESUME_PATH,
     NAUKRI_ENABLED,
     NAUKRI_EXPORT_PATH,
     PREFERRED_LOCATIONS,
@@ -63,7 +64,6 @@ from application_outcome import (
     OUTCOME_RECOVERY_REQUIRED,
     application_outcome_label,
 )
-from application_profile import ApplicationProfile
 from db import (
     FINAL_APPLICATION_STATES,
     JOB_STATUS_DISCOVERED,
@@ -73,8 +73,17 @@ from db import (
     has_successful_application,
     init_db,
     queue_sheet_sync,
+    save_experience_check,
 )
 from eligibility import FRESH, Eligibility, evaluate_job, job_freshness, priority_score
+from experience_check import (
+    ELIGIBLE,
+    INELIGIBLE,
+    REVIEW_REQUIRED,
+    VerifiedExperience,
+    record_experience_check,
+    verified_resume_experience,
+)
 from resume_artifact import resolve_verified_resume
 from sheets_tracker import (
     DISABLED,
@@ -122,6 +131,7 @@ class PipelineSettings:
     sheet_tab: str = GOOGLE_SHEET_TAB
     chrome_profile: Path = CHROME_USER_DATA
     naukri_enabled: bool = NAUKRI_ENABLED
+    master_resume_path: Optional[Path] = MASTER_RESUME_PATH  # source of truth for verified experience
 
     def resolved_sheet_id(self) -> Optional[str]:
         return resolve_sheet_id(self.sheet_id, self.agent_dir)
@@ -158,6 +168,12 @@ def validate_configuration(settings: PipelineSettings) -> list[ConfigCheck]:
     threshold_ok = 1 <= float(settings.score_threshold) <= 10
     checks.append(ConfigCheck("APPLICATION_SCORE_THRESHOLD", threshold_ok,
                               f"{settings.score_threshold:g}/10" if threshold_ok else "must be between 1 and 10"))
+    verified = verified_experience(settings)
+    checks.append(ConfigCheck(
+        "Verified resume experience", verified is not None,
+        f"{verified.text} (from {verified.source})" if verified else
+        f"no '<N>+ years of experience' in the master resume ({settings.master_resume_path}): "
+        "every job goes to REVIEW_REQUIRED and nothing is applied", fatal=False))
     profile = Path(settings.chrome_profile)
     checks.append(ConfigCheck(
         "Naukri browser profile", profile.is_dir() and any(profile.iterdir()),
@@ -205,23 +221,22 @@ def print_configuration(checks: list[ConfigCheck], out: Callable[[str], None] = 
 # ---------------------------------------------------------------------------
 
 
-def applicant_experience() -> Optional[float]:
-    raw = ApplicationProfile.from_environment().total_experience
-    try:
-        return float(raw.split()[0]) if raw else None
-    except (ValueError, IndexError):
-        return None
+def verified_experience(settings: PipelineSettings) -> Optional[VerifiedExperience]:
+    """The experience the master ATS resume explicitly supports (never inflated)."""
+    return verified_resume_experience(settings.master_resume_path)
 
 
 def evaluate_candidate(job: dict, settings: PipelineSettings, reference_time: datetime,
-                       agent_output_dir: Optional[Path] = None) -> Eligibility:
-    """The Phase 3.4 rules for one job, with its verified resume and application history."""
+                       agent_output_dir: Optional[Path] = None,
+                       verified: Optional[VerifiedExperience] = None) -> Eligibility:
+    """The Phase 3.4 rules for one job, with its verified resume, application history and the strict
+    experience check against the master resume."""
     artifact, _, _ = resolve_verified_resume(job["url"], agent_output_dir or settings.agent_output_dir)
     return evaluate_job(
         dict(job, history_applied=has_successful_application(job)),
         reference_time=reference_time,
         preferred_locations=settings.preferred_locations,
-        applicant_experience=applicant_experience(),
+        applicant_experience=verified if verified is not None else verified_experience(settings),
         score_threshold=settings.score_threshold,
         resume_ready=artifact is not None and artifact.verified,
         window_hours=settings.window_hours,
@@ -272,6 +287,8 @@ class RunSummary:
     scan_status: str = "SKIPPED"
     fresh_jobs: int = 0
     already_applied: int = 0
+    experience_ineligible: int = 0  # INELIGIBLE: skipped before scoring/tailoring or at eligibility
+    experience_review: int = 0  # REVIEW_REQUIRED: requirement unreadable or conflicting; never applied
     exported: int = 0
     agent_status: str = "SKIPPED"
     scores_imported: int = 0
@@ -328,6 +345,21 @@ class ApplicationPipeline:
         self.tracker_factory = tracker_factory or _default_tracker
         self.prompt, self.out, self.clock = prompt, out, clock
         self.summary = RunSummary(mode=self.settings.mode, dry_run=dry_run, window_hours=self.settings.window_hours)
+        self._verified: Optional[VerifiedExperience] = None
+        self._verified_loaded = False
+
+    @property
+    def verified(self) -> Optional[VerifiedExperience]:
+        if not self._verified_loaded:
+            self._verified, self._verified_loaded = verified_experience(self.settings), True
+        return self._verified
+
+    def _experience_rejected(self, job: dict, status: str, reason: str) -> None:
+        if status == INELIGIBLE:
+            self.summary.experience_ineligible += 1
+        elif status == REVIEW_REQUIRED:
+            self.summary.experience_review += 1
+        self.out(f"  [{job['id']}] {job.get('title') or '?'} @ {job.get('company') or '?'}: {reason}")
 
     # -- steps -------------------------------------------------------------------------
 
@@ -397,9 +429,14 @@ class ApplicationPipeline:
 
     def filter_fresh(self) -> list[dict]:
         """Fresh (within the window) stored jobs that still need anything; already-applied ones are
-        counted and dropped. Returns the fresh, never-applied, unscored jobs to export."""
+        counted and dropped. Returns the fresh, never-applied, unscored jobs to export.
+
+        The strict experience check runs here, before export, so a job whose JD needs more experience
+        than the master resume supports (or whose requirement is unreadable) never reaches AI scoring
+        or tailoring. The result is stored on the jobs row."""
         reference = self.clock()
         pending = []
+        header = False
         for job in get_jobs(status=None):
             if job.get("application_state") in FINAL_APPLICATION_STATES and not already_applied(job):
                 continue  # external / unavailable: nothing left to do
@@ -409,7 +446,14 @@ class ApplicationPipeline:
             if already_applied(job):
                 self.summary.already_applied += 1
             elif job.get("status") == JOB_STATUS_DISCOVERED:
-                pending.append(job)
+                check = record_experience_check(job, self.verified)
+                if check.status == ELIGIBLE:
+                    pending.append(job)
+                    continue
+                if not header:
+                    self.out("Experience check (before AI scoring / tailoring):")
+                    header = True
+                self._experience_rejected(job, check.status, check.reason)
         return pending
 
     def export_and_score(self, fresh_pending: list[dict]) -> None:
@@ -453,11 +497,14 @@ class ApplicationPipeline:
         eligible = []
         for job in get_application_candidates():
             self.summary.candidates += 1
-            result = evaluate_candidate(job, self.settings, reference)
+            result = evaluate_candidate(job, self.settings, reference, verified=self.verified)
+            save_experience_check(job["id"], result.experience_check)
             if result.eligible:
                 eligible.append((job, result))
+            elif result.experience_status != ELIGIBLE:
+                self._experience_rejected(job, result.experience_status, result.reason)
             else:
-                logger.info(f"Not eligible | db_id={job['id']} | {job['title']} @ {job['company']} | {result.reason}")
+                self.out(f"  [{job['id']}] {job['title']} @ {job['company']}: not eligible: {result.reason}")
         eligible.sort(key=lambda item: (-priority_score(item[0], item[1]), item[0]["id"]))
         self.summary.eligible = len(eligible)
         return [job for job, _ in eligible]
@@ -518,6 +565,52 @@ class ApplicationPipeline:
         self.summary.sheets = sync_pending_outcomes(self.tracker_factory(sheet_id, settings.sheet_tab))
 
 
+def run_eligibility_check(settings: PipelineSettings, out: Callable[[str], None] = print,
+                          clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> dict:
+    """Non-submitting report: the experience check for every stored, not-yet-applied job (stored on its
+    row) and the full eligibility of the application candidates. No browser, no export, no AI Agent,
+    no Google Sheets, nothing is applied. Returns {status: [job, ...]} for the candidates."""
+    init_db()
+    verified = verified_experience(settings)
+    reference = clock()
+    out(f"Verified resume experience: {verified.text + ' (' + verified.source + ')' if verified else 'NOT FOUND'}")
+    out(f"Mode: {settings.mode} (this check never applies)\n")
+    totals = {ELIGIBLE: 0, INELIGIBLE: 0, REVIEW_REQUIRED: 0}
+    review = []
+    for job in get_jobs(status=None):
+        if already_applied(job) or job.get("application_state") in FINAL_APPLICATION_STATES:
+            continue
+        check = record_experience_check(job, verified)
+        totals[check.status] += 1
+        if check.status == REVIEW_REQUIRED:
+            review.append((job, check))
+    out("EXPERIENCE CHECK - all stored jobs not yet applied")
+    for status, count in totals.items():
+        out(f"  {status:<16}{count:>5}")
+    for job, check in review:
+        out(f"  [{job['id']}] {job.get('title')} @ {job.get('company')}: {check.reason}")
+
+    groups = {"ELIGIBLE": [], "SKIPPED": [], "REVIEW_REQUIRED": [], "NOT ELIGIBLE (other rule)": []}
+    for job in get_application_candidates():
+        result = evaluate_candidate(job, settings, reference, verified=verified)
+        if result.eligible:
+            key = "ELIGIBLE"
+        elif result.experience_status == INELIGIBLE:
+            key = "SKIPPED"
+        elif result.experience_status == REVIEW_REQUIRED:
+            key = "REVIEW_REQUIRED"
+        else:
+            key = "NOT ELIGIBLE (other rule)"
+        groups[key].append((job, result))
+    out("\nAPPLICATION CANDIDATES (scored 'recommended', not applied)")
+    for key, items in groups.items():
+        out(f"  {key}: {len(items)}")
+        for job, result in items:
+            out(f"    [{job['id']}] {job['title']} @ {job['company']} | JD {result.experience_check.required_text or '-'}"
+                f" | {result.freshness_status} | {result.reason}")
+    return groups
+
+
 def _default_scanner():
     from naukri_scanner import NaukriScanner
     return NaukriScanner(headless=False)
@@ -566,6 +659,8 @@ def format_summary(s: RunSummary) -> str:
              row("Skipped", s.skipped_scores),
              "", "ELIGIBILITY", thin,
              row("Recommended candidates", s.candidates),
+             row("Experience: skipped", s.experience_ineligible),
+             row("Experience: review", s.experience_review),
              row("Eligible", s.eligible),
              "", "APPLICATIONS", thin]
     if s.dry_run:
@@ -596,6 +691,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--skip-scan", action="store_true", help="use the jobs already stored in SQLite")
     parser.add_argument("--skip-agent", action="store_true", help="do not run the AI Agent (scores are still imported)")
     parser.add_argument("--sync-only", action="store_true", help="only retry pending Google Sheets synchronization")
+    parser.add_argument("--eligibility-check", action="store_true",
+                        help="report the experience check and eligibility of stored jobs; no browser, export, "
+                             "AI Agent, Sheets or application")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     args = parser.parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level),
@@ -605,6 +703,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         checks = validate_configuration(settings)
         print_configuration(checks)
         return EXIT_OK if configuration_ok(checks) else EXIT_CONFIG
+    if args.eligibility_check:
+        run_eligibility_check(settings)
+        return EXIT_OK
     pipeline = ApplicationPipeline(settings, dry_run=args.dry_run, skip_scan=args.skip_scan,
                                    skip_agent=args.skip_agent, no_apply=args.no_apply, sync_only=args.sync_only)
     try:

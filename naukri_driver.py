@@ -19,6 +19,7 @@ from naukri_scanner import (
 )
 from resume_matcher import ResumeMatcher
 from gemini_engine import GeminiEngine
+from experience_check import ELIGIBLE, check_experience, verified_resume_experience
 from hitl_engine import HITLEngine
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ class NaukriDriver:
             self.gemini = None
             logger.warning("GeminiEngine not initialized")
         self.hitl = hitl_engine or HITLEngine()
+        self.verified_experience = verified_resume_experience()  # master resume; None blocks every job
         self.playwright = None
         self.browser = None
         self.page = None
@@ -115,6 +117,12 @@ class NaukriDriver:
                         continue
 
                     job_description = self._get_job_description(card)
+                    experience = check_experience(dict(job_data, job_description=job_description),
+                                                  self.verified_experience)
+                    if experience.status != ELIGIBLE:  # strict, before matching or any Apply click
+                        logger.info(f"Job: {job_data['title']} @ {job_data['company']} | {experience.reason}")
+                        results["skipped"] += 1
+                        continue
                     match_score = self.matcher.calculate_match_score(job_description)
 
                     logger.info(
@@ -169,6 +177,9 @@ class NaukriDriver:
                 "company": job.company,
                 "url": job.url,
                 "platform": "Naukri",
+                "experience_min": job.experience_min,
+                "experience_max": job.experience_max,
+                "experience_text": job.experience_text,
             }
         except Exception as e:
             logger.error(f"Error extracting job data: {e}")

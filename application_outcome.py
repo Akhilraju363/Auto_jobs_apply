@@ -12,6 +12,8 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+from experience_check import EXPERIENCE_CODES
+
 # Codes added in Phase 3.3 (stored in jobs.application_code / application_attempts.code).
 SUBMISSION_UNCONFIRMED = "SUBMISSION_UNCONFIRMED"  # Apply/Submit clicked, no confirmation
 INTERRUPTED_AFTER_APPLY = "INTERRUPTED_AFTER_APPLY"  # run ended (crash, Ctrl+C) after Apply was clicked
@@ -144,6 +146,8 @@ def application_outcome_label(state: Optional[str], code: Optional[str] = None) 
     if state in ("preparing", "review_required", "approved", "submitting"):
         return OUTCOME_APPLYING
     if state in ("external_application", "job_unavailable"):
+        return OUTCOME_SKIPPED
+    if state == "not_ready" and code in EXPERIENCE_CODES:  # refused by the experience guard, not a failure
         return OUTCOME_SKIPPED
     if state in ("failed", "requires_login", "requires_manual_action", "not_ready"):
         return OUTCOME_FAILED

@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from experience_check import ELIGIBLE, VerifiedExperience, check_experience
+
 FRESH = "FRESH"
 STALE = "STALE"
 UNKNOWN = "UNKNOWN"
@@ -114,17 +116,16 @@ def location_match(location: Any, preferred: list[str]) -> Optional[bool]:
     return bool(values & configured)
 
 
-def experience_match(job: dict, applicant_experience: Optional[float]) -> Optional[bool]:
-    if applicant_experience is None:
-        return None
-    low, high = job.get("experience_min"), job.get("experience_max")
-    if low is None and high is None:
-        text = str(job.get("experience_text") or "")
-        numbers = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", text)]
-        if not numbers:
-            return None
-        low, high = numbers[0], numbers[-1]
-    return applicant_experience >= low and (high is None or applicant_experience <= high)
+def _verified(applicant_experience: Any) -> Optional[VerifiedExperience]:
+    if applicant_experience is None or isinstance(applicant_experience, VerifiedExperience):
+        return applicant_experience
+    return VerifiedExperience(float(applicant_experience), f"{float(applicant_experience):g} years")
+
+
+def experience_match(job: dict, applicant_experience: Any) -> Optional[bool]:
+    """Strict check (experience_check.py): True ELIGIBLE, False INELIGIBLE, None REVIEW_REQUIRED.
+    Compares the JD's minimum required years only; being above a range's maximum is not a mismatch."""
+    return check_experience(job, _verified(applicant_experience)).match
 
 
 def _score_10(value: Any) -> Optional[float]:
@@ -144,6 +145,9 @@ class Eligibility:
     resume_ready: bool
     eligible: bool
     reason: str
+    experience_status: Optional[str] = None  # experience_check: ELIGIBLE / INELIGIBLE / REVIEW_REQUIRED
+    experience_reason: str = ""
+    experience_check: Any = None  # the full experience_check.ExperienceCheck
 
 
 def evaluate_job(
@@ -151,7 +155,7 @@ def evaluate_job(
     *,
     reference_time: datetime,
     preferred_locations: list[str],
-    applicant_experience: Optional[float] = None,
+    applicant_experience: Any = None,  # experience_check.VerifiedExperience (master resume) or years
     resume_ready: bool = True,
     score_threshold: float = 8,
     window_hours: int = 24,
@@ -159,31 +163,34 @@ def evaluate_job(
     freshness, _ = job_freshness(job, reference_time=reference_time, window_hours=window_hours)
     loc = job.get("location_match")
     loc = bool(loc) if loc is not None else location_match(job.get("location"), preferred_locations)
-    exp = job.get("experience_match")
-    exp = bool(exp) if exp is not None else experience_match(job, applicant_experience)
+    # Strict and never overridden by an AI score: only the master resume's verified years count, and a
+    # job whose requirement cannot be read (REVIEW_REQUIRED) is never eligible.
+    experience = check_experience(job, _verified(applicant_experience))
+    exp = experience.match
     score = _score_10(job.get("match_score"))
     blocked = job.get("application_state") in {
         "recovery_required", "already_applied", "applied", "external_application", "job_unavailable",
     } or job.get("is_already_applied") or job.get("history_applied")
     eligible = (
         freshness == FRESH and score is not None and score >= score_threshold
-        and loc is not False and exp is not False and resume_ready and not blocked
+        and loc is not False and experience.status == ELIGIBLE and resume_ready and not blocked
     )
     if blocked:
         reason = "application history blocks this job"
+    elif experience.status != ELIGIBLE:
+        reason = experience.reason
     elif freshness != FRESH:
         reason = f"freshness is {freshness}"
     elif score is None or score < score_threshold:
         reason = "score is below the application threshold"
     elif loc is False:
         reason = "location is not preferred"
-    elif exp is False:
-        reason = "experience does not match"
     elif not resume_ready:
         reason = "verified resume is not ready"
     else:
         reason = "ready for human review"
-    return Eligibility(freshness, loc, exp, score, resume_ready, eligible, reason)
+    return Eligibility(freshness, loc, exp, score, resume_ready, eligible, reason,
+                       experience.status, experience.reason, experience)
 
 
 def priority_score(job: dict, result: Eligibility) -> int:

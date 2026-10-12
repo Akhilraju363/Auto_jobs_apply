@@ -35,24 +35,40 @@ from application_profile import ApplicationProfile, ResumeEvidence
 from config import (
     AI_AGENT_OUTPUT_DIR,
     CONFIRMATION_WAIT_SECONDS,
+    MASTER_RESUME_PATH,
     NAUKRI_APPLICATION_TIMEOUT,
     NAUKRI_NAVIGATION_RETRIES,
 )
 from db import (
+    FINAL_APPLICATION_STATES,
     finish_attempt,
     get_application_record,
+    get_job,
     has_successful_application,
     mark_apply_clicked,
     open_attempts,
     record_application_attempt,
     resolve_unconfirmed_record,
+    save_experience_check,
     set_application_state,
     start_attempt,
+)
+from experience_check import (
+    ELIGIBLE,
+    EXPERIENCE_CODES,
+    EXPERIENCE_INELIGIBLE,
+    EXPERIENCE_REVIEW_REQUIRED,
+    INELIGIBLE,
+    VerifiedExperience,
+    check_experience,
+    verified_resume_experience,
 )
 from naukri_parser import detect_block, is_login_page
 from resume_artifact import RESUME_ARTIFACT_MISMATCH, RESUME_PDF_NOT_FOUND, resolve_verified_resume
 
 logger = logging.getLogger(__name__)
+
+_FROM_MASTER_RESUME = object()  # ApplicationRunner default: read the verified experience from MASTER_RESUME_PATH
 
 # Explicit outcome codes (stored in jobs.application_code).
 AUTH_REQUIRED = "AUTH_REQUIRED"
@@ -894,12 +910,18 @@ class ApplicationRunner:
         answers=None,
         agent_output_dir: Optional[Path] = AI_AGENT_OUTPUT_DIR,
         evidence: Optional[ResumeEvidence] = None,
+        verified_experience=_FROM_MASTER_RESUME,
     ):
         """answers: ApplicationProfile or a field->value mapping (default: APPLICANT_* from .env).
-        evidence: master-resume skills for yes/no skill questions (default: MASTER_RESUME_PATH)."""
+        evidence: master-resume skills for yes/no skill questions (default: MASTER_RESUME_PATH).
+        verified_experience: experience_check.VerifiedExperience the experience guard compares against
+        (default: parsed from MASTER_RESUME_PATH; None means unverified, so every job is blocked)."""
         self.browser, self.prompt, self.out, self.dry_run = browser, prompt, out, dry_run
         self.profile = ApplicationProfile.from_environment() if answers is None else _as_profile(answers)
         self.evidence = ResumeEvidence.from_file() if evidence is None else evidence
+        self.verified_experience: Optional[VerifiedExperience] = (
+            verified_resume_experience(MASTER_RESUME_PATH) if verified_experience is _FROM_MASTER_RESUME
+            else verified_experience)
         self.agent_output_dir = agent_output_dir
         self.navigation_retries = NAUKRI_NAVIGATION_RETRIES
         self.confirmation_wait = CONFIRMATION_WAIT_SECONDS
@@ -980,6 +1002,9 @@ class ApplicationRunner:
             finish_attempt(self._attempt_id, state, code, reason, success=state == "applied",
                            confirmation_signal=result.confirmation_signal, external_url=result.external_url)
             self._attempt_id = None
+        if code in EXPERIENCE_CODES:  # refused before anything was opened: no failure event, no diagnostics
+            self._event("EXPERIENCE_BLOCKED", job, state, code=code)
+            return result
         if state == "applied":
             self._event("APPLICATION_CONFIRMED", job, state, signal=result.confirmation_signal)
         elif state == "recovery_required":
@@ -1033,10 +1058,50 @@ class ApplicationRunner:
                 finish_attempt(attempt_id, state, code, "previous run ended without finishing this attempt")
         return decision
 
+    # Application states the experience guard never overwrites (history and recovery belong to them).
+    _GUARD_KEEPS_STATE = FINAL_APPLICATION_STATES + ("recovery_required",)
+
+    def experience_gate(self, job: dict) -> Optional[ApplicationResult]:
+        """Mandatory experience eligibility, enforced here whatever the caller did beforehand.
+
+        None when the job may continue. Otherwise the job is refused before the job page, resume,
+        attempt log or Apply control is touched: INELIGIBLE -> EXPERIENCE_INELIGIBLE, anything not
+        clearly eligible (missing, conflicting or unreadable requirement, unverified resume, an error)
+        -> EXPERIENCE_REVIEW_REQUIRED. Both the passed job and its stored jobs row are checked, so a
+        caller cannot loosen the requirement by editing the dict; the stricter result wins. The
+        state becomes not_ready (never applied, applied_jobs untouched); a final or
+        recovery_required state is left as it is."""
+        try:
+            stored = get_job(job["id"]) if job.get("id") is not None else None
+            checks = [check_experience(j, self.verified_experience) for j in ([stored] if stored else []) + [job]]
+            check = next((c for c in checks if c.status == INELIGIBLE), None)                 or next((c for c in checks if c.status != ELIGIBLE), None) or checks[0]
+            if not self.dry_run and stored:
+                save_experience_check(job["id"], check)
+        except Exception as e:  # noqa: BLE001 -- eligibility unknown: fail closed
+            logger.error(f"Experience check failed for db_id={job.get('id')}: {type(e).__name__}: {e}")
+            stored, check = None, None
+        if check is not None and check.status == ELIGIBLE:
+            return None
+        if check is None:
+            code, reason = EXPERIENCE_REVIEW_REQUIRED, ("Review required: experience eligibility could not be "
+                                                        "established, so this job is not applied.")
+        else:
+            code = EXPERIENCE_INELIGIBLE if check.status == INELIGIBLE else EXPERIENCE_REVIEW_REQUIRED
+            reason = check.reason
+        self.out(f"[{job.get('id')}] {job.get('title') or '?'} @ {job.get('company') or '?'}: {reason}")
+        if (stored or job).get("application_state") in self._GUARD_KEEPS_STATE:
+            self._event("EXPERIENCE_BLOCKED", job, code=code)
+            return ApplicationResult(job["id"], "not_ready", code, reason)
+        return self._result(job, "not_ready", code, reason)
+
     def process(self, job: dict) -> ApplicationResult:
         self._begin()
         self._event("APPLICATION_START", job, dry_run=self.dry_run or None)
         decision = self.idempotency(job)
+        if decision.proceed:
+            blocked = self.experience_gate(job)  # before the job page, resume, attempt log or Apply
+            if blocked is not None:
+                return blocked
         if not decision.proceed:
             self._event("IDEMPOTENCY_BLOCKED", job, decision.state, code=decision.code)
             if decision.state == "already_applied":

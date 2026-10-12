@@ -10,6 +10,7 @@ from config import CHROME_USER_DATA, MATCH_THRESHOLD, DAILY_LIMIT, JOB_TITLES
 from db import is_job_applied, log_job_application, get_applied_jobs_count
 from resume_matcher import ResumeMatcher
 from gemini_engine import GeminiEngine
+from experience_check import ELIGIBLE, check_experience, verified_resume_experience
 from hitl_engine import HITLEngine
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ class LinkedInDriver:
             self.gemini = None
             logger.warning("GeminiEngine not initialized")
         self.hitl = hitl_engine or HITLEngine()
+        self.verified_experience = verified_resume_experience()  # master resume; None blocks every job
         self.playwright = None
         self.browser = None
         self.context = None
@@ -105,6 +107,12 @@ class LinkedInDriver:
                         continue
 
                     job_description = self._get_job_description(card)
+                    experience = check_experience(dict(job_data, job_description=job_description),
+                                                  self.verified_experience)
+                    if experience.status != ELIGIBLE:  # strict, before matching or any Apply click
+                        logger.info(f"Job: {job_data['title']} @ {job_data['company']} | {experience.reason}")
+                        results["skipped"] += 1
+                        continue
                     match_score = self.matcher.calculate_match_score(job_description)
 
                     logger.info(
