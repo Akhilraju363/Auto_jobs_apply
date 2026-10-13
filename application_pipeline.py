@@ -22,12 +22,18 @@ one SAFE-mode application has been confirmed.
 """
 
 import argparse
+import io
 import json
 import logging
+import os
 import shutil
+import subprocess
 import sys
+import threading
+import traceback
+import uuid
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -44,6 +50,7 @@ from config import (
     APPLICATION_MAX_JOBS,
     APPLICATION_MODE,
     APPLICATION_SCORE_THRESHOLD,
+    BASE_DIR,
     CHROME_USER_DATA,
     DB_PATH,
     GOOGLE_SHEET_ID,
@@ -52,9 +59,12 @@ from config import (
     MASTER_RESUME_PATH,
     NAUKRI_ENABLED,
     NAUKRI_EXPORT_PATH,
+    NAUKRI_LOGIN_WAIT_MINUTES,
     PREFERRED_LOCATIONS,
 )
+from ai_agent_bridge import scope_id as bridge_scope_id
 from ai_agent_bridge import (
+    SCOPE_SAFE_STAGES,
     AgentRunResult,
     agent_canonical_link,
     read_scope_report,
@@ -78,10 +88,15 @@ from db import (
     get_jobs,
     has_successful_application,
     init_db,
+    inspect_database_readonly,
     queue_sheet_sync,
     save_experience_check,
 )
-from eligibility import FRESH, Eligibility, evaluate_job, job_freshness, priority_score
+from eligibility import FRESH, RESUME_NOT_READY_REASON, Eligibility, evaluate_job, job_freshness, priority_score
+from export_priority import priority as export_priority
+from export_priority import relevance_order
+
+EXPORT_ORDER_LABEL = "ranked by role relevance, then matching skills, then expiry risk"
 from experience_check import (
     ELIGIBLE,
     INELIGIBLE,
@@ -151,19 +166,28 @@ class ConfigCheck:
     fatal: bool = True  # a failing fatal check stops the run before anything happens
 
 
-def validate_configuration(settings: PipelineSettings) -> list[ConfigCheck]:
-    """Everything the pipeline needs, checked up front. Never creates the browser profile."""
+def validate_configuration(settings: PipelineSettings, initialize_db: bool = True) -> list[ConfigCheck]:
+    """Everything the pipeline needs, checked up front. Never creates the browser profile.
+
+    initialize_db=False (--check-config): read-only. The database is inspected with
+    db.inspect_database_readonly() instead of init_db(), so no file, table or migration is created.
+    Nothing here opens a browser or contacts a service."""
     checks = []
     mode_ok = settings.mode in MODES
     checks.append(ConfigCheck("APPLICATION_MODE", mode_ok,
                               settings.mode if mode_ok else f"{settings.mode!r} is not SAFE or AUTO"))
-    try:
-        init_db()
-        checks.append(ConfigCheck("SQLite database", True, str(DB_PATH)))
-        confirmed = count_successful_applications()
-    except Exception as e:  # noqa: BLE001 -- reported, the run stops
-        checks.append(ConfigCheck("SQLite database", False, f"{type(e).__name__}: {e}"))
-        confirmed = 0
+    if initialize_db:
+        try:
+            init_db()
+            checks.append(ConfigCheck("SQLite database", True, str(DB_PATH)))
+            confirmed = count_successful_applications()
+        except Exception as e:  # noqa: BLE001 -- reported, the run stops
+            checks.append(ConfigCheck("SQLite database", False, f"{type(e).__name__}: {e}"))
+            confirmed = 0
+    else:
+        database = inspect_database_readonly()
+        checks.append(readonly_database_check(database))
+        confirmed = database["confirmed_applications"] or 0
     if settings.mode == AUTO:
         checks.append(ConfigCheck(
             "AUTO mode readiness", confirmed > 0,
@@ -217,6 +241,26 @@ def validate_configuration(settings: PipelineSettings) -> list[ConfigCheck]:
     return checks
 
 
+def readonly_database_check(database: dict) -> ConfigCheck:
+    """The SQLite check for --check-config, from db.inspect_database_readonly() (nothing is written).
+    A database that does not exist yet or misses tables is a warning: the next pipeline run's
+    init_db() creates them. An unreadable database is fatal, as it is for a run."""
+    path = database["path"]
+    if database["error"]:
+        return ConfigCheck("SQLite database", False, f"{path}: {database['error']}")
+    if not database["exists"]:
+        detail = ("not created yet: the first pipeline run copies the legacy jobs.db here"
+                  if database["legacy_migration_pending"] else "not created yet: the first pipeline run creates it")
+        return ConfigCheck("SQLite database", False, f"{path} {detail} (read-only check)", fatal=False)
+    if database["missing_tables"]:
+        return ConfigCheck("SQLite database", False,
+                           f"{path} has no {', '.join(database['missing_tables'])} table(s) yet: the next "
+                           "pipeline run creates them (read-only check)", fatal=False)
+    confirmed = database["confirmed_applications"]
+    return ConfigCheck("SQLite database", True,
+                       f"{path} (read-only check, {confirmed} confirmed application(s) in history)")
+
+
 def export_limit_check(raw: str, effective: int) -> ConfigCheck:
     """AI_AGENT_EXPORT_LIMIT as configured vs as used. Never fatal: an invalid value falls back (see config)."""
     detail = (f"{effective} job(s)/run; deferred fresh jobs are offered again next run, a low cap can let "
@@ -258,9 +302,14 @@ def evaluate_candidate(job: dict, settings: PipelineSettings, reference_time: da
                        agent_output_dir: Optional[Path] = None,
                        verified: Optional[VerifiedExperience] = None) -> Eligibility:
     """The Phase 3.4 rules for one job, with its verified resume, application history and the strict
-    experience check against the master resume."""
-    artifact, _, _ = resolve_verified_resume(job["url"], agent_output_dir or settings.agent_output_dir)
-    return evaluate_job(
+    experience check against the master resume.
+
+    When the resume is what blocks the job, the reason carries the resolver's own code and reason (missing
+    resume, record for another job, unverified version, missing file ...) instead of only "not ready", and
+    says so when this run's Agent stages never tailor. Only the reason text changes, never `eligible`."""
+    artifact, resume_code, resume_reason = resolve_verified_resume(
+        job["url"], agent_output_dir or settings.agent_output_dir)
+    result = evaluate_job(
         dict(job, history_applied=has_successful_application(job)),
         reference_time=reference_time,
         preferred_locations=settings.preferred_locations,
@@ -269,6 +318,12 @@ def evaluate_candidate(job: dict, settings: PipelineSettings, reference_time: da
         resume_ready=artifact is not None and artifact.verified,
         window_hours=settings.window_hours,
     )
+    if result.reason == RESUME_NOT_READY_REASON and resume_code:
+        detail = f"{RESUME_NOT_READY_REASON} ({resume_code}: {resume_reason})"
+        if "tailor_job.py" not in settings.agent_stages:
+            detail += "; this workflow's AI Agent stages do not include tailor_job.py, so no resume is created"
+        result = replace(result, reason=detail)
+    return result
 
 
 def already_applied(job: dict) -> bool:
@@ -296,6 +351,104 @@ def mode_prompt(mode: str, prompt: Callable[[str], str] = input,
         return answer
 
     return auto
+
+
+# ApplicationRunner prompts, as the auto-apply workflow answers them.
+SUBMIT_ANSWERS_PROMPT = "Submit these answers?"  # asked only when every field was planned from configured facts
+VERIFICATION_PROMPT = "Press Enter when done, or q to stop"  # CAPTCHA / verification page before Apply
+
+
+def auto_apply_prompt(prompt: Callable[[str], str] = input,
+                      out: Callable[[str], None] = print) -> Callable[[str], str]:
+    """The answer function for the auto-apply workflow (APPLICATION_MODE=AUTO).
+
+    - review approval: 'y' -- the job passed eligibility, the current-run scope, identity and resume checks;
+    - 'Submit these answers?': 'y' -- ApplicationRunner asks it only after every form field was planned
+      from configured APPLICANT_* facts; any field it cannot fill from them is handed off before this;
+    - CAPTCHA / verification page before Apply: a real pause for YOU (the runner re-checks the page
+      after Enter; q, or no console, stops the run). Nothing is solved or bypassed;
+    - any other manual step (unanswerable question, manual handoff): 's' -- that job is left for manual
+      completion and recorded; nothing is guessed."""
+    def answer(message: str) -> str:
+        if message.startswith(APPROVAL_PROMPT):
+            out(f"{message}y   [auto-apply: approved after every eligibility, scope, identity and resume check]")
+            return "y"
+        if message.startswith(SUBMIT_ANSWERS_PROMPT):
+            out(f"{message}y   [auto-apply: every answer came from your configured facts]")
+            return "y"
+        if message.startswith(VERIFICATION_PROMPT):
+            out("[auto-apply: Naukri shows a verification page; complete it yourself in the browser]")
+            return prompt(message)
+        reply = "s" if "s = stop" in message or "s to leave" in message else "q"
+        out(f"{message}{reply}   [auto-apply: needs a human; left for manual completion]")
+        return reply
+
+    return answer
+
+
+# Per-application outcomes of auto-apply runs (result.json "applications").
+APPLIED_CONFIRMED = "APPLIED_CONFIRMED"
+APPLICATION_FAILED = "APPLICATION_FAILED"
+APPLICATION_SKIPPED = "APPLICATION_SKIPPED"
+AUTH_REQUIRED_OUTCOME = "AUTH_REQUIRED"
+CAPTCHA_REQUIRED_OUTCOME = "CAPTCHA_REQUIRED"
+APPLICATION_STATUS_UNKNOWN = "APPLICATION_STATUS_UNKNOWN"
+# After these, the browser or the account is in a state another automatic application must not follow.
+STOP_AFTER_OUTCOMES = (AUTH_REQUIRED_OUTCOME, CAPTCHA_REQUIRED_OUTCOME, APPLICATION_STATUS_UNKNOWN)
+
+
+def submission_outcome(state: Optional[str], code: Optional[str]) -> str:
+    """One label per job. Only Naukri's own confirmation ('applied') is APPLIED_CONFIRMED; an outcome
+    Apply may have caused that nobody confirmed (recovery_required) is STATUS_UNKNOWN, never success."""
+    if state == "applied":
+        return APPLIED_CONFIRMED
+    if state == "recovery_required":
+        return APPLICATION_STATUS_UNKNOWN
+    if code == "CAPTCHA_REQUIRED":
+        return CAPTCHA_REQUIRED_OUTCOME
+    if state == "requires_login" or code == "AUTH_REQUIRED":
+        return AUTH_REQUIRED_OUTCOME
+    if state in ("failed", "submission_failed"):
+        return APPLICATION_FAILED
+    return APPLICATION_SKIPPED  # already applied, external, unavailable, not ready, manual completion, ...
+
+
+def _job_identity(job: dict) -> dict:
+    return {"job_id": job.get("id"), "naukri_job_id": job.get("job_id"), "title": job.get("title"),
+            "company": job.get("company")}
+
+
+def _scope_key(job: dict) -> str:
+    """The id this job carries in the scope file (ai_agent_bridge.scope_id of its export record)."""
+    return str(job.get("job_id") or job.get("dedup_key") or agent_canonical_link(job.get("url")))
+
+
+def validate_run_scope(scope_path: Optional[Path], run_id: Optional[str], expected: dict) -> dict:
+    """Re-read this run's scope file and require it to be exactly what this run exported:
+    the same run_id and the same set of job ids. expected: {jobs.id: scope id}. Read-only.
+    Returns {"ok", "detail", "run_id", "scope_file", "job_ids"}; ok=False means nothing may be applied."""
+    report = {"ok": False, "detail": "", "run_id": run_id, "scope_file": str(scope_path) if scope_path else None,
+              "job_ids": sorted(expected)}
+    if not run_id or scope_path is None or not expected:
+        report["detail"] = "nothing was exported this run"
+        return report
+    try:
+        data = json.loads(Path(scope_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        report["detail"] = f"scope file unreadable: {type(e).__name__}"
+        return report
+    if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
+        report["detail"] = 'scope file is not an object with a "jobs" list'
+        return report
+    if data.get("run_id") != run_id:
+        report["detail"] = f"scope file belongs to run {data.get('run_id')!r}, not this run {run_id!r}"
+        return report
+    ids = [str(entry.get("id")) for entry in data["jobs"] if isinstance(entry, dict)]
+    if len(ids) != len(data["jobs"]) or sorted(ids) != sorted(expected.values()):
+        report["detail"] = "scope file jobs differ from the jobs this run exported"
+        return report
+    report.update(ok=True, detail="scope file matches this run's export")
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +479,7 @@ class RunSummary:
     export_deferred: int = 0  # valid but past AI_AGENT_EXPORT_LIMIT: offered again next run if still fresh
     export_limit: int = 0
     exported_ids: list = field(default_factory=list)  # jobs.id of the jobs exported this run
+    agent_export_id: Optional[str] = None  # run_id of this run's export/scope file; None = nothing exported
     # What the AI Agent newly scored / tailored during this run (from its output files, before vs after):
     # jobs this run exported vs anything else it processed (e.g. its own cached LinkedIn jobs).
     agent_new_scored: Optional[int] = None
@@ -356,6 +510,11 @@ class RunSummary:
     failed: int = 0
     recovery_required: int = 0
     dry_run_ready: int = 0
+    # auto-apply runs only (None = not an auto-apply run, or the step did not run)
+    scope_validation: Optional[dict] = None  # this run's scope file re-checked before eligibility
+    candidates_outside_run: Optional[int] = None  # recommended jobs from earlier runs: never evaluated here
+    eligibility_results: Optional[list] = None  # one record per current-run candidate
+    applications: Optional[list] = None  # one record per job the application step decided on
     stopped: Optional[str] = None
     sheets: SyncReport = field(default_factory=lambda: SyncReport(status="SKIPPED"))
     warnings: list = field(default_factory=list)
@@ -380,6 +539,8 @@ class ApplicationPipeline:
         skip_agent: bool = False,
         no_apply: bool = False,
         sync_only: bool = False,
+        login_wait_minutes: int = 0,
+        auto_apply: bool = False,
         scanner_factory: Optional[Callable] = None,
         browser_factory: Optional[Callable] = None,
         runner_factory: Optional[Callable] = None,
@@ -392,6 +553,13 @@ class ApplicationPipeline:
         self.settings = settings or PipelineSettings()
         self.dry_run, self.skip_scan, self.skip_agent = dry_run, skip_scan, skip_agent
         self.no_apply, self.sync_only = no_apply, sync_only
+        # > 0 (--wait-for-login): when the session check finds the login page, open Naukri's login page in
+        # the same visible browser and wait this long for a manual login (never typed for you), once.
+        self.login_wait_minutes = login_wait_minutes
+        # auto-apply workflow: candidates only from this run's validated scope, auto_apply_prompt, the Naukri
+        # job identity checked before Apply, per-job records. Never set by the CLI default.
+        self.auto_apply = auto_apply
+        self._run_scope: tuple = (None, None, {})  # (scope file, run_id, {jobs.id: scope id}) of this export
         self.scanner_factory = scanner_factory or _default_scanner
         self.browser_factory = browser_factory or _default_browser
         self.runner_factory = runner_factory or _default_runner
@@ -456,6 +624,14 @@ class ApplicationPipeline:
         try:
             with self.browser_factory() as browser:
                 state = browser.session_state()
+                if state == "login_required" and self.login_wait_minutes > 0:
+                    self.out(f"Naukri login required. Log in by hand in the opened browser window (OTP/CAPTCHA "
+                             f"included); waiting up to {self.login_wait_minutes} minute(s). Nothing is typed for you.")
+                    state = "authenticated" if browser.wait_for_login(self.login_wait_minutes, out=self.out) \
+                        else "login_required"
+                    self.out("Naukri login confirmed; continuing." if state == "authenticated" else
+                             "Naukri login not completed in time; continuing without it (the scan may stop at a "
+                             "login page). Not retried.")
         except Exception as e:  # noqa: BLE001 -- profile locked, browser missing, network
             code = getattr(e, "code", None) or type(e).__name__
             self.summary.naukri_login = "ERROR"
@@ -534,11 +710,23 @@ class ApplicationPipeline:
             s.export_deferred = max(0, len(fresh_pending) - s.exported)
             s.agent_status = "SKIPPED (dry run)"
         else:
+            # Relevance first (target Java / Full Stack roles, matching skills), then expiry risk, then id:
+            # with a cap of 2, the order decides which fresh jobs get scored at all (export_priority.py).
+            self._export_reference = self.clock()
             export = export_discovered_jobs(self.settings.export_path, self.settings.export_limit,
-                                            job_filter=lambda job: job["id"] in wanted)
+                                            job_filter=lambda job: job["id"] in wanted,
+                                            order_key=relevance_order(self._export_reference,
+                                                                      self.settings.window_hours),
+                                            order_label=EXPORT_ORDER_LABEL)
             s.exported, s.export_rejected, s.export_deferred = (len(export.exported), len(export.skipped),
                                                                 len(export.deferred))
             s.exported_ids = export.exported_ids
+            if export.exported:
+                s.agent_export_id = export.run_id
+                # EXPORTED decisions and export.exported are appended together, in the same order.
+                self._run_scope = (export.scope_path, export.run_id,
+                                   {job_id: bridge_scope_id(record)
+                                    for job_id, record in zip(export.exported_ids, export.exported)})
             self._print_export_decisions(fresh_pending, export.decisions)
             if self.skip_agent:
                 s.agent_status = "SKIPPED (--skip-agent)"
@@ -588,9 +776,12 @@ class ApplicationPipeline:
         counts = Counter(decision for _, decision, _ in decisions)
         self.out(f"Export to AI Agent: {len(decisions)} fresh, experience-eligible, unscored job(s) -> "
                  + ", ".join(f"{counts[d]} {d.lower()}" for d in ("EXPORTED", "DEFERRED", "REJECTED") if counts[d]))
+        reference = getattr(self, "_export_reference", None)
         for job_id, decision, reason in decisions:
             job = jobs.get(job_id, {})
-            self.out(f"  [{job_id}] {decision:<8} {job.get('title') or '?'} @ {job.get('company') or '?'}"
+            rank = (f" [{export_priority(job, reference, self.settings.window_hours).describe()}]"
+                    if job and reference is not None else "")
+            self.out(f"  [{job_id}] {decision:<8} {job.get('title') or '?'} @ {job.get('company') or '?'}{rank}"
                      + (f": {reason}" if reason else ""))
 
     def _account_agent_activity(self, before: Optional[tuple], after: Optional[tuple], exported: set) -> None:
@@ -612,10 +803,20 @@ class ApplicationPipeline:
     def eligibility(self) -> list[dict]:
         reference = self.clock()
         eligible = []
+        allowed = self._current_run_candidates() if self.auto_apply else None
         for job in get_application_candidates():
+            if allowed is not None and allowed.get(job["id"]) != _scope_key(job):
+                # an earlier run's recommendation (or a scope mismatch): never evaluated or applied here
+                self.summary.candidates_outside_run += 1
+                continue
             self.summary.candidates += 1
             result = evaluate_candidate(job, self.settings, reference, verified=self.verified)
             save_experience_check(job["id"], result.experience_check)
+            if allowed is not None:
+                self.summary.eligibility_results.append(dict(
+                    _job_identity(job), eligible=result.eligible, reason=result.reason, score=result.score,
+                    freshness=result.freshness_status, experience=result.experience_status,
+                    location_match=result.location_match, resume_ready=result.resume_ready))
             if result.eligible:
                 eligible.append((job, result))
             elif result.experience_status != ELIGIBLE:
@@ -626,30 +827,91 @@ class ApplicationPipeline:
         self.summary.eligible = len(eligible)
         return [job for job, _ in eligible]
 
+    def _current_run_candidates(self) -> dict:
+        """auto-apply: {jobs.id: scope id} of this run's export, after re-validating the scope file.
+        An invalid or missing scope means no candidate at all -- never a fallback to history."""
+        s = self.summary
+        scope_path, run_id, expected = self._run_scope
+        s.scope_validation = validate_run_scope(scope_path, run_id, expected)
+        s.candidates_outside_run, s.eligibility_results = 0, []
+        if not s.scope_validation["ok"]:
+            if expected:  # something was exported but the scope cannot be trusted: say so
+                s.warnings.append(f"Current-run scope rejected: {s.scope_validation['detail']}; nothing is applied")
+            return {}
+        return dict(expected)
+
     def apply(self, eligible: list[dict]) -> None:
         s = self.summary
-        batch = eligible[: self.settings.max_applications]
+        limit = self.settings.max_applications
+        batch = eligible[:limit]
+        if self.auto_apply:
+            s.applications = [self._application_record(job, None, APPLICATION_SKIPPED, "PER_RUN_LIMIT",
+                                                       f"over the per-run application limit (APPLICATION_MAX_JOBS={limit})")
+                              for job in eligible[limit:]]
         if not batch:
             return
         self.out(f"\n{'DRY RUN - ' if self.dry_run else ''}{s.mode} mode: {len(batch)} application(s) this run"
                  + ("" if s.mode == AUTO else "; each one needs your exact 'y' or 'yes' before Apply is clicked"))
-        answer = mode_prompt(s.mode, self.prompt, self.out)
+        answer = auto_apply_prompt(self.prompt, self.out) if self.auto_apply else mode_prompt(s.mode, self.prompt, self.out)
+        attempted = set()
+        runner = None
         try:
             with self.browser_factory() as browser:
                 runner = self.runner_factory(browser, answer, self.out, self.dry_run)
+                if self.auto_apply:
+                    runner.require_job_identity = True  # the opened page must be this exact Naukri job
                 for job in batch:
+                    attempted.add(job["id"])
                     try:
                         result = runner.process(job)
                     except Exception as e:  # ApplicationStop (login, CAPTCHA, quit) or a browser failure
                         s.stopped = f"{getattr(e, 'code', type(e).__name__)}: {e}"
                         self._track(job)  # the runner already persisted whatever state it reached
+                        if self.auto_apply:
+                            s.applications.append(self._stopped_record(job, e, runner))
                         break
                     self._count(result)
                     self._track(job)
+                    if self.auto_apply:
+                        outcome = submission_outcome(result.state, result.code)
+                        s.applications.append(self._application_record(
+                            job, result.state, outcome, result.code, result.reason, runner, result))
+                        if outcome in STOP_AFTER_OUTCOMES:  # browser/account state not safe to continue
+                            s.stopped = f"{outcome} on job {job['id']}: no further automatic application this run"
+                            break
         except Exception as e:  # noqa: BLE001 -- the browser could not start
             s.stopped = f"{getattr(e, 'code', type(e).__name__)}: {e}"
+        if self.auto_apply:
+            for job in batch:
+                if job["id"] not in attempted or not any(r["job_id"] == job["id"] for r in s.applications):
+                    s.applications.append(self._application_record(
+                        job, None, APPLICATION_SKIPPED, "NOT_ATTEMPTED", f"not attempted: applications stopped "
+                                                                         f"({s.stopped})", runner))
         if s.stopped:
             s.warnings.append(f"Applications stopped: {s.stopped}")
+
+    def _application_record(self, job: dict, state: Optional[str], outcome: str, code: Optional[str],
+                            reason: str, runner=None, result=None) -> dict:
+        """One auto-apply result.json entry. Unknown parts are None, never guessed."""
+        resume = getattr(result, "resume", None) if result is not None else None
+        identity = getattr(runner, "identity_checks", {}).get(job["id"]) if runner is not None else None
+        return dict(_job_identity(job), outcome=outcome, state=state, code=code, reason=reason,
+                    confirmation_signal=getattr(result, "confirmation_signal", None),
+                    identity_check=identity,
+                    resume={"version": getattr(resume, "version", None),
+                            "file_type": resume.path.suffix[1:] if getattr(resume, "path", None) else None,
+                            "uploadable": getattr(resume, "uploadable", None)} if resume is not None else None,
+                    manual_completion_required=state == "requires_manual_action")
+
+    def _stopped_record(self, job: dict, error: Exception, runner) -> dict:
+        """The job a run stopped on (login, CAPTCHA, quit, browser failure): as the runner persisted it."""
+        stored = get_job(job["id"]) or job
+        state = stored.get("application_state")
+        code = getattr(error, "code", None) or stored.get("application_code")
+        outcome = submission_outcome(state, code)
+        if outcome == APPLICATION_SKIPPED and state not in (None, "ready", "not_ready", "preparing"):
+            outcome = APPLICATION_FAILED  # stopped part-way, nothing confirmed
+        return self._application_record(job, state, outcome, code, str(error), runner)
 
     def _count(self, result) -> None:
         s = self.summary
@@ -836,7 +1098,8 @@ def format_summary(s: RunSummary) -> str:
              row("  would export (dry run)" if s.dry_run else "  exported to AI Agent", s.exported),
              row(f"  deferred (limit {s.export_limit}/run)", s.export_deferred),
              "", "AI AGENT (this run's exported jobs only)", thin,
-             row("AI Agent", s.agent_status)]
+             row("AI Agent", s.agent_status),
+             row("Agent export ID", s.agent_export_id or "-")]
     if s.exported and not s.dry_run:
         lines += _agent_lines(s, row)
         if s.agent_new_in_store is not None:
@@ -860,8 +1123,16 @@ def format_summary(s: RunSummary) -> str:
     lines += [row("Applied", s.applied),
               row("Skipped", s.application_skipped),
               row("Failed", s.failed),
-              row("Recovery required", s.recovery_required),
-              "", "GOOGLE SHEETS", thin,
+              row("Recovery required", s.recovery_required)]
+    if s.scope_validation is not None:  # auto-apply run
+        lines += ["", "AUTO-APPLY (this run's exported jobs only)", thin,
+                  row("Current-run scope", "OK" if s.scope_validation["ok"] else
+                      f"REJECTED ({s.scope_validation['detail']})"),
+                  row("Earlier runs' jobs (not touched)", s.candidates_outside_run)]
+        for record in s.applications or []:
+            lines.append(f"  [{record['job_id']}] {record['outcome']:<27} {record['title'] or '?'} @ "
+                         f"{record['company'] or '?'}" + (f": {record['reason']}" if record["reason"] else ""))
+    lines += ["", "GOOGLE SHEETS", thin,
               row("Status", sheet_status),
               row("Rows written", s.sheets.synced),
               row("Pending sync", s.sheets.pending)]
@@ -874,9 +1145,482 @@ def format_summary(s: RunSummary) -> str:
     return "\n".join(lines)
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+# ---------------------------------------------------------------------------
+# Run folders, run.log and result.json (--run-dir), and the read-only --last-run viewer
+# ---------------------------------------------------------------------------
+
+RUNS_DIR = BASE_DIR / "output" / "runs"  # start_local.bat's runs; output/ is git-ignored
+REPORT_NAME = "result.json"
+LOG_NAME = "run.log"
+REPORT_SCHEMA_VERSION = 1
+EXIT_MEANINGS = {
+    EXIT_OK: "run complete",
+    EXIT_CONFIG: "configuration invalid or unrecoverable error (see the log)",
+    EXIT_ATTENTION: "run finished but needs your attention (see the warnings)",
+}
+CLI_WORKFLOW = "cli"
+# The menu workflows of start_local.bat (local_launcher.py). Both are preparation only: the pipeline
+# itself refuses them unless every setting below holds (workflow_guard), so a launcher mistake
+# cannot turn one into an application run.
+SCAN_AND_SCORE, FULL_PREPARATION = "scan-and-score", "full-preparation"
+# Opt-in automatic applications (start_local.bat with launcher_workflow.json {"workflow": "auto-apply"}).
+# The only launcher workflow that may submit: AUTO mode (still refused until one SAFE-mode application
+# is confirmed), this run's validated scope only, Naukri job identity checked before Apply.
+AUTO_APPLY = "auto-apply"
+WORKFLOWS = (CLI_WORKFLOW, SCAN_AND_SCORE, FULL_PREPARATION, AUTO_APPLY)
+PREPARATION_EXPORT_LIMIT, PREPARATION_WINDOW_HOURS = 2, 24
+AUTO_APPLY_STAGES = ("scrape_jobs.py", "score_jobs.py", "tailor_job.py")
+AUTO_APPLY_MAX_APPLICATIONS = 2  # upper bound only: APPLICATION_MAX_JOBS from .env is used as configured
+AUTO_APPLY_MIN_SCORE = 8.0
+
+
+def exit_meaning(code: Optional[int]) -> str:
+    if code is None:
+        return "unknown: the run ended without a final exit code"
+    return EXIT_MEANINGS.get(code, "unexpected exit code")
+
+
+def new_run_dir(base: Optional[Path] = None, now: Optional[datetime] = None) -> Path:
+    """Create and return a new, empty run folder <base>/<YYYYmmddTHHMMSS>-<random>. mkdir without
+    exist_ok is atomic, so two runs started in the same second never share (or overwrite) a folder."""
+    base = Path(base or RUNS_DIR)
+    stamp = (now or datetime.now()).strftime("%Y%m%dT%H%M%S")
+    base.mkdir(parents=True, exist_ok=True)
+    for _ in range(100):
+        candidate = base / f"{stamp}-{uuid.uuid4().hex[:6]}"
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"could not create a unique run folder in {base}")
+
+
+def prepare_run_dir(path: Path) -> Path:
+    """--run-dir: use this folder for run.log and result.json. Refused when it already holds either,
+    so an earlier run's report or log is never overwritten."""
+    path = Path(path)
+    existing = [name for name in (REPORT_NAME, LOG_NAME) if (path / name).exists()]
+    if existing:
+        raise ValueError(f"{path} already holds {', '.join(existing)} from another run; use a new folder")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+class _Tee(io.TextIOBase):
+    """Writes to the console stream and the run log. The console never stops the log: characters the
+    console cannot encode are replaced there, the log (UTF-8) keeps them."""
+
+    def __init__(self, stream, log):
+        self.stream, self.log = stream, log
+
+    def write(self, text):
+        try:
+            self.stream.write(text)
+        except UnicodeEncodeError:
+            encoding = getattr(self.stream, "encoding", None) or "ascii"
+            self.stream.write(text.encode(encoding, "replace").decode(encoding))
+        if self.log is not None:
+            self.log.write(text)
+            self.log.flush()
+        return len(text)
+
+    def flush(self):
+        self.stream.flush()
+        if self.log is not None:
+            self.log.flush()
+
+    def isatty(self):
+        return self.stream.isatty()
+
+    @property
+    def encoding(self):
+        return getattr(self.stream, "encoding", "utf-8")
+
+
+def streaming_agent_runner(argv, cwd=None, env=None, timeout=None, check=False):
+    """subprocess.run replacement for run_agent_stages when a run log is kept: the Agent stage's
+    stdout and stderr are copied line by line to sys.stdout (console + run.log) instead of going
+    straight to the console, so stage errors are in the log. Same contract: returns an object with
+    returncode, raises subprocess.TimeoutExpired after killing the stage."""
+    child_env = dict(os.environ if env is None else env)
+    child_env.setdefault("PYTHONIOENCODING", "utf-8")
+    proc = subprocess.Popen(argv, cwd=cwd, env=child_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    def pump():
+        for raw in proc.stdout:
+            # "\r\n" from a Windows child -> "\n": the text-mode console/log add their own line ending
+            # (writing "\r\n" as is gave "\r\r\n" in run.log).
+            sys.stdout.write(raw.decode("utf-8", "replace").replace("\r\n", "\n"))
+        proc.stdout.close()
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        reader.join(5)
+        raise
+    reader.join()
+    return subprocess.CompletedProcess(argv, proc.returncode)
+
+
+def logged_agent_stages(*args, **kwargs) -> AgentRunResult:
+    """run_agent_stages (same scope rules, unchanged) with each stage's output copied into run.log."""
+    return run_agent_stages(*args, runner=streaming_agent_runner, **kwargs)
+
+
+def own_env_keys(env_file: Path = BASE_DIR / ".env") -> set:
+    """Key names (never values) defined in this project's .env."""
+    from dotenv import dotenv_values
+    return set(dotenv_values(env_file)) if Path(env_file).is_file() else set()
+
+
+def workflow_guard(workflow: str, args, settings: PipelineSettings, env=None,
+                   project_env_keys: Optional[set] = None) -> list[str]:
+    """Problems that make a start_local.bat workflow unsafe to run (empty = OK). The CLI workflow
+    ('cli') has no extra rules. scan-and-score / full-preparation are preparation only and must never
+    reach Apply; auto-apply must be exactly the bounded AUTO configuration (nothing looser)."""
+    if workflow == CLI_WORKFLOW:
+        return []
+    env = os.environ if env is None else env
+    keys = own_env_keys() if project_env_keys is None else project_env_keys
+    problems = []
+    if "artifact_sync" in keys:
+        # ai_agent_bridge.agent_environment drops every key named in this project's .env before
+        # starting the Agent, so artifact_sync=0 would never reach it.
+        problems.append("remove artifact_sync from this project's .env (it would be dropped before the Agent "
+                        "starts, so Drive mirroring could not be kept off)")
+    if args.sync_only:
+        problems.append("--sync-only is not a menu workflow")
+    if workflow == AUTO_APPLY:
+        if args.no_apply:
+            problems.append("auto-apply cannot be combined with --no-apply")
+        if settings.mode != AUTO:
+            problems.append(f"APPLICATION_MODE must be AUTO for auto-apply (is {settings.mode})")
+        if list(settings.agent_stages) != list(AUTO_APPLY_STAGES):
+            problems.append(f"AI_AGENT_STAGES must be {','.join(AUTO_APPLY_STAGES)} for auto-apply "
+                            f"(is {','.join(settings.agent_stages)})")
+        if not 1 <= settings.max_applications <= AUTO_APPLY_MAX_APPLICATIONS:
+            problems.append(f"APPLICATION_MAX_JOBS must be 1-{AUTO_APPLY_MAX_APPLICATIONS} for auto-apply "
+                            f"(is {settings.max_applications})")
+        if float(settings.score_threshold) < AUTO_APPLY_MIN_SCORE:
+            problems.append(f"APPLICATION_SCORE_THRESHOLD must be at least {AUTO_APPLY_MIN_SCORE:g} for "
+                            f"auto-apply (is {float(settings.score_threshold):g})")
+    else:
+        if not args.no_apply:
+            problems.append("--no-apply is required (menu workflows never submit applications)")
+        if settings.mode != SAFE:
+            problems.append(f"APPLICATION_MODE must be SAFE (is {settings.mode})")
+    if settings.sheets_enabled:
+        problems.append("GOOGLE_SHEETS_ENABLED must be false (queued rows stay queued)")
+    if (env.get("artifact_sync") or "").strip().lower() not in ("0", "false", "off", "no"):
+        problems.append("artifact_sync must be 0 (no Agent artifact mirroring to Drive)")
+    if settings.export_limit != PREPARATION_EXPORT_LIMIT:
+        problems.append(f"AI_AGENT_EXPORT_LIMIT must be {PREPARATION_EXPORT_LIMIT} (is {settings.export_limit})")
+    if settings.window_hours != PREPARATION_WINDOW_HOURS:
+        problems.append(f"APPLICATION_JOB_WINDOW_HOURS must be {PREPARATION_WINDOW_HOURS} (is {settings.window_hours})")
+    unsafe = [stage for stage in settings.agent_stages if stage not in SCOPE_SAFE_STAGES]
+    if unsafe:
+        problems.append(f"AI_AGENT_STAGES has stage(s) that cannot be scoped: {', '.join(unsafe)}")
+    if workflow == SCAN_AND_SCORE and "tailor_job.py" in settings.agent_stages:
+        problems.append("scan-and-score must not run tailor_job.py")
+    return problems
+
+
+def _known(value, known: bool):
+    return value if known else None
+
+
+def report_counts(s: RunSummary, *, no_apply: bool, sync_only: bool) -> dict:
+    """RunSummary counts for result.json. A count from a step that did not run is None (unknown),
+    never 0."""
+    ran = not s.fatal and not sync_only
+    scanned = ran and (s.scan_status == "OK" or s.scan_status.startswith("STOPPED"))
+    agent_ran = ran and not s.dry_run and bool(s.exported)
+    applied = ran and not no_apply and s.naukri_login == "OK"
+    return {
+        "scan": {key: _known(getattr(s, key), scanned) for key in (
+            "jobs_scanned", "new_jobs", "duplicates_removed", "skipped_stale_cards",
+            "skipped_experience_cards", "description_missing")},
+        "freshness": {key: _known(getattr(s, key), ran) for key in ("fresh_jobs", "already_applied")},
+        "export": {key: _known(getattr(s, key), ran) for key in (
+            "discovered_unscored", "not_fresh_unscored", "export_experience_ineligible",
+            "export_experience_review", "export_candidates", "export_rejected", "exported",
+            "export_deferred", "export_limit")},
+        "agent": {
+            "newly_scored": _known(s.agent_new_scored, agent_ran),
+            "newly_tailored": _known(s.agent_new_tailored, agent_ran),
+            "other_jobs_scored": _known(s.agent_new_scored_other, agent_ran),
+            "other_jobs_tailored": _known(s.agent_new_tailored_other, agent_ran),
+            "new_in_agent_store": _known(s.agent_new_in_store, agent_ran),
+            "exported_scored": _known(s.exported_scored, agent_ran),
+            "exported_recommended": _known(s.exported_recommended, agent_ran),
+        },
+        "scores_imported": {key: _known(getattr(s, key), ran and not s.dry_run) for key in (
+            "scores_imported", "recommended", "review", "skipped_scores")},
+        "eligibility": {key: _known(getattr(s, key), ran) for key in (
+            "candidates", "eligible", "experience_ineligible", "experience_review")},
+        "applications": {key: _known(getattr(s, key), applied) for key in (
+            "applied", "application_skipped", "failed", "recovery_required", "dry_run_ready")},
+        "google_sheets": {"status": s.sheets.status, "rows_written": _known(s.sheets.synced, not s.fatal),
+                          "pending": _known(s.sheets.pending, not s.fatal)},
+    }
+
+
+def report_stages(s: RunSummary, *, no_apply: bool, sync_only: bool) -> dict:
+    """One status per pipeline step. Steps that never started say NOT RUN, not SKIPPED or OK."""
+    if s.fatal:
+        not_run = "NOT RUN (configuration invalid)"
+        return {"configuration": "FAILED", "naukri_session": not_run, "scan": not_run, "export": not_run,
+                "ai_agent": not_run, "applications": not_run, "google_sheets": not_run}
+    if sync_only:
+        not_run = "NOT RUN (--sync-only)"
+        return {"configuration": "OK", "naukri_session": not_run, "scan": not_run, "export": not_run,
+                "ai_agent": not_run, "applications": not_run, "google_sheets": s.sheets.status}
+    if no_apply:
+        applications = "SKIPPED (--no-apply)"
+    elif s.naukri_login != "OK":
+        applications = f"SKIPPED (Naukri login: {s.naukri_login})"
+    else:
+        applications = f"STOPPED ({s.stopped})" if s.stopped else "OK"
+    export = ("SKIPPED (dry run)" if s.dry_run else
+              f"{s.exported} exported, {s.export_deferred} deferred, {s.export_rejected} rejected")
+    return {"configuration": "OK", "naukri_session": s.naukri_login, "scan": s.scan_status, "export": export,
+            "ai_agent": s.agent_status, "applications": applications, "google_sheets": s.sheets.status}
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc).astimezone()  # local time with its UTC offset
+
+
+def write_json_atomic(path: Path, data: dict) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+class RunRecorder:
+    """--run-dir: copies the console to run.log and keeps result.json current.
+
+    result.json is written when the run starts (status "running", exit_code null) and replaced
+    atomically when it ends, so a run that was killed still leaves an honest, incomplete report."""
+
+    def __init__(self, run_dir: Path, workflow: str, options: dict, settings: PipelineSettings,
+                 clock: Callable[[], datetime] = _now):
+        self.run_dir = Path(run_dir)
+        self.report_path, self.log_path = self.run_dir / REPORT_NAME, self.run_dir / LOG_NAME
+        self.clock = clock
+        self._log = None
+        self._streams = None
+        self.started = clock()
+        self.report = {
+            "schema_version": REPORT_SCHEMA_VERSION,
+            "run_id": self.run_dir.name,
+            "status": "running",
+            "started_at": self.started.isoformat(),
+            "finished_at": None,
+            "duration_seconds": None,
+            "workflow": workflow,
+            "application_mode": settings.mode,
+            "no_apply": bool(options.get("no_apply")),
+            "options": options,
+            "effective_settings": {
+                "agent_stages": list(settings.agent_stages),
+                "export_limit": settings.export_limit,
+                "window_hours": settings.window_hours,
+                "score_threshold": settings.score_threshold,
+                "max_applications": settings.max_applications,
+                "naukri_enabled": settings.naukri_enabled,
+                "google_sheets_enabled": settings.sheets_enabled,
+                "artifact_sync": os.environ.get("artifact_sync"),  # None = not set (Agent default: on)
+                "agent_job_sources": "naukri",  # always set by ai_agent_bridge.agent_environment
+            },
+            "exit_code": None,
+            "exit_meaning": None,
+            "stages": None,
+            "agent_export_id": None,
+            "exported_job_ids": None,
+            "agent_scope_report": None,
+            "counts": None,
+            "warnings": [],
+            "fatal": None,
+            "error": None,
+            # auto-apply only (null otherwise, or when the step did not run)
+            "scope_validation": None,
+            "candidates_outside_run": None,
+            "eligibility_results": None,
+            "applications": None,
+            "application_outcomes": None,
+            "summary_text": None,
+            "log_file": str(self.log_path),
+            "report_file": str(self.report_path),
+        }
+
+    def start(self) -> None:
+        self._log = open(self.log_path, "x", encoding="utf-8")  # "x": never append to another run's log
+        self._streams = (sys.stdout, sys.stderr)
+        sys.stdout, sys.stderr = _Tee(sys.stdout, self._log), _Tee(sys.stderr, self._log)
+        print(f"Run {self.report['run_id']} ({self.report['workflow']}): log {self.log_path}")
+        self.save()
+
+    def save(self) -> None:
+        write_json_atomic(self.report_path, self.report)
+
+    def finish(self, status: str, exit_code: Optional[int], summary: Optional[RunSummary] = None,
+               no_apply: bool = False, sync_only: bool = False, fatal: Optional[str] = None,
+               error: Optional[str] = None, complete: bool = True) -> None:
+        """complete=False (crash, Ctrl+C): the summary is partial, so only facts it already holds
+        (export id, exported jobs, warnings) are recorded; stages and counts stay null (unknown)."""
+        finished = self.clock()
+        self.report.update(status=status, finished_at=finished.isoformat(),
+                           duration_seconds=round((finished - self.started).total_seconds(), 1),
+                           exit_code=exit_code, exit_meaning=exit_meaning(exit_code), fatal=fatal, error=error)
+        if summary is not None:
+            self.report.update(agent_export_id=summary.agent_export_id, warnings=list(summary.warnings),
+                               fatal=summary.fatal or fatal)
+            # Applications already decided are facts even in a partial run (crash/Ctrl+C afterwards).
+            applications = summary.applications
+            self.report.update(
+                scope_validation=summary.scope_validation, candidates_outside_run=summary.candidates_outside_run,
+                eligibility_results=summary.eligibility_results, applications=applications,
+                application_outcomes=(dict(Counter(a["outcome"] for a in applications))
+                                      if applications is not None else None))
+            if summary.agent_export_id:
+                self.report["exported_job_ids"] = list(summary.exported_ids)
+            if complete:
+                self.report.update(
+                    stages=report_stages(summary, no_apply=no_apply, sync_only=sync_only),
+                    exported_job_ids=(None if summary.fatal or sync_only or summary.dry_run
+                                      else list(summary.exported_ids)),
+                    agent_scope_report=summary.scope_report,
+                    counts=report_counts(summary, no_apply=no_apply, sync_only=sync_only),
+                    summary_text=format_summary(summary),
+                )
+        self.save()
+
+    def close(self) -> None:
+        if self._streams is not None:
+            for tee in (sys.stdout, sys.stderr):
+                if isinstance(tee, _Tee):
+                    tee.flush()
+                    tee.log = None  # logging handlers may still hold the tee: console only from now on
+            sys.stdout, sys.stderr = self._streams
+            self._streams = None
+        if self._log is not None:
+            self._log.close()
+            self._log = None
+
+
+def load_report(path: Path) -> tuple[Optional[dict], Optional[str]]:
+    """(report, None) or (None, problem). Read-only."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, "no result.json"
+    except (OSError, UnicodeDecodeError) as e:
+        return None, f"unreadable: {type(e).__name__}"
+    except ValueError as e:
+        return None, f"not valid JSON: {e}"
+    if not isinstance(data, dict):
+        return None, "not a JSON object"
+    missing = [key for key in ("run_id", "started_at", "status") if not data.get(key)]
+    if missing:
+        return None, f"missing {', '.join(missing)}"
+    return data, None
+
+
+def find_last_run(runs_dir: Optional[Path] = None) -> tuple[Optional[dict], Optional[Path], list[tuple[Path, str]]]:
+    """The newest readable report under runs_dir (folders are named by start time, newest last).
+    Returns (report, its path, [(newer folder, problem), ...] skipped on the way). Read-only."""
+    runs_dir = Path(runs_dir or RUNS_DIR)
+    skipped = []
+    if not Path(runs_dir).is_dir():
+        return None, None, skipped
+    folders = sorted((p for p in Path(runs_dir).iterdir() if p.is_dir()), key=lambda p: p.name, reverse=True)
+    for folder in folders:
+        report, problem = load_report(folder / REPORT_NAME)
+        if report is not None:
+            return report, folder / REPORT_NAME, skipped
+        skipped.append((folder, problem))
+    return None, None, skipped
+
+
+def format_last_run(report: dict, path: Path, skipped: list[tuple[Path, str]]) -> str:
+    def value(key, default="unknown"):
+        found = report.get(key)
+        return default if found is None or found == "" else found
+
+    exit_code = report.get("exit_code")
+    lines = ["LAST RUN", "-" * 60]
+    for folder, problem in skipped:
+        lines.append(f"(skipped newer folder {folder.name}: {problem})")
+    lines += [
+        f"{'Run ID:':<22}{value('run_id')}",
+        f"{'Status:':<22}{value('status')}",
+        f"{'Started:':<22}{value('started_at')}",
+        f"{'Finished:':<22}{value('finished_at', 'not recorded')}",
+        f"{'Duration (s):':<22}{value('duration_seconds', 'not recorded')}",
+        f"{'Workflow:':<22}{value('workflow')}",
+        f"{'Mode:':<22}{value('application_mode')}{' (--no-apply)' if report.get('no_apply') else ''}",
+        f"{'Exit code:':<22}{'not recorded' if exit_code is None else exit_code} ({exit_meaning(exit_code)})",
+        f"{'Agent export ID:':<22}{value('agent_export_id', 'none (nothing exported, or unknown)')}",
+        f"{'Exported job IDs:':<22}{report.get('exported_job_ids') if report.get('exported_job_ids') is not None else 'unknown'}",
+    ]
+    if report.get("status") == "running":
+        lines.append("WARNING: this run never finished its report (killed or still running); treat it as failed.")
+    stages = report.get("stages")
+    if isinstance(stages, dict):
+        lines += ["", "Stages:"] + [f"  {name:<20}{status}" for name, status in stages.items()]
+    for label, key in (("Fatal", "fatal"), ("Error", "error")):
+        if report.get(key):
+            lines.append(f"{label}: {report[key]}")
+    warnings = report.get("warnings") or []
+    if warnings:
+        lines += ["", "Warnings:"] + [f"  - {w}" for w in warnings]
+    if report.get("summary_text"):
+        lines += ["", report["summary_text"]]
+    lines += ["", f"{'Report:':<22}{path}", f"{'Log:':<22}{value('log_file', path.parent / LOG_NAME)}"]
+    return "\n".join(lines)
+
+
+def show_last_run(runs_dir: Optional[Path] = None, out: Callable[[str], None] = print) -> int:
+    """--last-run. Reads only: no database, browser, network, new folder or file."""
+    runs_dir = Path(runs_dir or RUNS_DIR)
+    report, path, skipped = find_last_run(runs_dir)
+    if report is None:
+        if skipped:
+            out(f"No readable run report in {runs_dir}:")
+            for folder, problem in skipped:
+                out(f"  {folder.name}: {problem}")
+            return EXIT_CONFIG
+        out(f"No previous runs found in {runs_dir}. Runs started from start_local.bat (options 2 and 3) "
+            "are recorded there.")
+        return EXIT_OK
+    out(format_last_run(report, path, skipped))
+    return EXIT_OK
+
+
+def _run_options(args) -> dict:
+    """The pipeline flags of this run, for result.json (flags only; never environment values)."""
+    return {key: getattr(args, key) for key in (
+        "no_apply", "dry_run", "skip_scan", "skip_agent", "sync_only", "wait_for_login", "log_level")}
+
+
+def main(argv: Optional[list[str]] = None, settings: Optional[PipelineSettings] = None,
+         pipeline_factory: Optional[Callable[..., "ApplicationPipeline"]] = None) -> int:
     parser = argparse.ArgumentParser(description="Naukri Auto Job Apply: one local run of the full workflow")
-    parser.add_argument("--check-config", action="store_true", help="validate configuration and exit")
+    parser.add_argument("--check-config", action="store_true",
+                        help="validate configuration and exit (read-only: never creates or changes the database)")
+    parser.add_argument("--last-run", action="store_true",
+                        help=f"show the newest run report under {RUNS_DIR} and exit (read-only)")
+    parser.add_argument("--run-dir", type=Path, default=None,
+                        help="record this run in DIR: run.log (console copy) and result.json (structured report)")
+    parser.add_argument("--workflow", choices=WORKFLOWS, default=CLI_WORKFLOW,
+                        help="workflow label for result.json; the start_local.bat workflows are preparation only "
+                             "and are refused unless --no-apply, SAFE, Sheets off and artifact_sync=0 all hold")
     parser.add_argument("--dry-run", action="store_true",
                         help="open and check jobs but never click Apply, export, run the AI Agent or write Sheets")
     parser.add_argument("--no-apply", action="store_true", help="stop after eligibility (no application browser)")
@@ -886,28 +1630,81 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--eligibility-check", action="store_true",
                         help="report the experience check and eligibility of stored jobs; no browser, export, "
                              "AI Agent, Sheets or application")
+    parser.add_argument("--wait-for-login", action="store_true",
+                        help="if the Naukri session check finds the login page, wait in the visible browser "
+                             f"(NAUKRI_LOGIN_WAIT_MINUTES, {NAUKRI_LOGIN_WAIT_MINUTES} min) for a manual login, "
+                             "once, then continue; nothing is typed for you")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     args = parser.parse_args(argv)
+    if args.last_run:
+        return show_last_run()
+    if args.run_dir is not None and (args.check_config or args.eligibility_check):
+        parser.error("--run-dir records pipeline runs; it cannot be combined with --check-config or --eligibility-check")
+    if args.workflow != CLI_WORKFLOW and args.run_dir is None:
+        parser.error(f"--workflow {args.workflow} requires --run-dir")
+    recorder = None
+    settings = settings or PipelineSettings()
+    if args.run_dir is not None:
+        try:
+            run_dir = prepare_run_dir(args.run_dir)
+        except (ValueError, OSError) as e:
+            print(f"[FAIL] --run-dir: {e}", file=sys.stderr)
+            return EXIT_CONFIG
+        recorder = RunRecorder(run_dir, args.workflow, _run_options(args), settings)
+        recorder.start()  # before logging is configured, so log records go to run.log too
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(asctime)s | %(name)s | %(levelname)-8s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    settings = PipelineSettings()
     if args.check_config:
-        checks = validate_configuration(settings)
+        checks = validate_configuration(settings, initialize_db=False)
         print_configuration(checks)
         return EXIT_OK if configuration_ok(checks) else EXIT_CONFIG
     if args.eligibility_check:
         run_eligibility_check(settings)
         return EXIT_OK
-    pipeline = ApplicationPipeline(settings, dry_run=args.dry_run, skip_scan=args.skip_scan,
-                                   skip_agent=args.skip_agent, no_apply=args.no_apply, sync_only=args.sync_only)
     try:
+        return _run_pipeline(args, settings, recorder, pipeline_factory or ApplicationPipeline)
+    finally:
+        if recorder is not None:
+            recorder.close()
+            print(f"Run report: {recorder.report_path}\nRun log:    {recorder.log_path}")
+
+
+def _run_pipeline(args, settings: PipelineSettings, recorder: Optional[RunRecorder], pipeline_factory) -> int:
+    problems = workflow_guard(args.workflow, args, settings)
+    if problems:
+        fatal = f"workflow {args.workflow} refused: " + "; ".join(problems)
+        print(f"[FAIL] {fatal}. Nothing was run.")
+        if recorder is not None:
+            recorder.finish("failed", EXIT_CONFIG, fatal=fatal)
+        return EXIT_CONFIG
+    agent_options = {"agent_runner": logged_agent_stages} if recorder is not None else {}
+    pipeline = None
+    try:
+        pipeline = pipeline_factory(settings, dry_run=args.dry_run, skip_scan=args.skip_scan,
+                                    skip_agent=args.skip_agent, no_apply=args.no_apply, sync_only=args.sync_only,
+                                    login_wait_minutes=NAUKRI_LOGIN_WAIT_MINUTES if args.wait_for_login else 0,
+                                    auto_apply=args.workflow == AUTO_APPLY,  # passed workflow_guard above
+                                    **agent_options)
         summary = pipeline.run()
     except KeyboardInterrupt:
         print("\nInterrupted. Everything already recorded stays in SQLite; an interrupted application "
               "is detected and sent to recovery on the next run.")
+        if recorder is not None:
+            recorder.finish("interrupted", EXIT_ATTENTION, pipeline and pipeline.summary, args.no_apply,
+                            args.sync_only, error="interrupted (Ctrl+C) before the run finished", complete=False)
         return EXIT_ATTENTION
+    except BaseException as e:
+        if recorder is not None:
+            traceback.print_exc()  # into run.log; the exception is re-raised unchanged
+            recorder.finish("crashed", EXIT_CONFIG, pipeline and pipeline.summary, args.no_apply, args.sync_only,
+                            error=f"{type(e).__name__}: {e}", complete=False)
+        raise
     print("\n" + format_summary(summary))
-    return summary.exit_code
+    code = summary.exit_code
+    if recorder is not None:
+        status = {EXIT_OK: "complete", EXIT_ATTENTION: "attention"}.get(code, "failed")
+        recorder.finish(status, code, summary, args.no_apply, args.sync_only)
+    return code
 
 
 if __name__ == "__main__":

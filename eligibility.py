@@ -145,6 +145,9 @@ def _score_10(value: Any) -> Optional[float]:
     return score / 10 if score > 10 else score
 
 
+RESUME_NOT_READY_REASON = "verified resume is not ready"
+
+
 @dataclass(frozen=True)
 class Eligibility:
     freshness_status: str
@@ -195,7 +198,7 @@ def evaluate_job(
     elif loc is False:
         reason = "location is not preferred"
     elif not resume_ready:
-        reason = "verified resume is not ready"
+        reason = RESUME_NOT_READY_REASON
     else:
         reason = "ready for human review"
     return Eligibility(freshness, loc, exp, score, resume_ready, eligible, reason,
@@ -212,5 +215,5 @@ def priority_score(job: dict, result: Eligibility) -> int:
 __all__ = [
     "FRESH", "STALE", "UNKNOWN", "Eligibility", "freshness_for", "job_freshness",
     "normalize_preferred_location", "location_match", "experience_match",
-    "evaluate_job", "priority_score",
+    "evaluate_job", "priority_score", "RESUME_NOT_READY_REASON",
 ]

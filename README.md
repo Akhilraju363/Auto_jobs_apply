@@ -323,9 +323,20 @@ the factual source of truth. `--action fresh-jobs` is read-only, and
 C:\Users\akhil\Auto_job_apply\start_local.bat
 ```
 
-runs the whole workflow: verify configuration and the Naukri session → scan → keep jobs posted within
-24 hours → drop already-applied jobs → AI Agent scoring → eligibility → verified resume → prepare and
-apply (SAFE: only after your exact `y`/`yes`) → verify → SQLite → Google Sheets → summary.
+starts the automatic **scan and score** run with one double-click (no menu, no prompt):
+read-only configuration check → Naukri scan in the visible browser with the saved profile (log in by
+hand there if Naukri asks) → fresh, 4+ years-eligible jobs → at most 2 exported → AI Agent scoring
+(scrape + score only, scoped to this run) → results, `launcher.log`, `run.log` and `result.json` in
+`output\runs\<run id>\`. By default it never submits an application, tailors a resume, uploads to Google
+Drive or writes Google Sheets (`--no-apply`, `APPLICATION_MODE=SAFE`). Automatic applications are opt-in:
+only a `launcher_workflow.json` with exactly `{"workflow": "auto-apply"}` enables them, and AUTO stays
+refused until one SAFE-mode application is confirmed (see "Auto-apply" in docs/PIPELINE.md). The developer menu (configuration check,
+scan and score, full preparation with tailoring, last run) is `.venv\Scripts\python.exe local_launcher.py --menu`.
+
+`.venv\Scripts\python.exe application_pipeline.py` (developer CLI) runs the whole workflow: verify
+configuration and the Naukri session → scan → keep jobs posted within 24 hours → drop already-applied
+jobs → AI Agent scoring → eligibility → verified resume → prepare and apply (SAFE: only after your exact
+`y`/`yes`) → verify → SQLite → Google Sheets → summary.
 
 - **SQLite** (`data/naukri_auto_apply.db`) is the source of truth. **Successfully applied job = never
   automatically resubmitted. Same company ≠ same job**: history matches the canonical job URL, Naukri
@@ -334,8 +345,8 @@ apply (SAFE: only after your exact `y`/`yes`) → verify → SQLite → Google S
   row pending for the next run and never causes a reapplication.
 - **`APPLICATION_MODE=SAFE`** is the default. `AUTO` is refused until one SAFE-mode application has
   been confirmed.
-- Useful flags: `--dry-run`, `--no-apply`, `--skip-scan`, `--skip-agent`, `--sync-only`;
-  `python application_pipeline.py --check-config` validates the setup.
+- Useful flags: `--dry-run`, `--no-apply`, `--skip-scan`, `--skip-agent`, `--sync-only`, `--last-run`;
+  `python application_pipeline.py --check-config` validates the setup (read-only).
 
 Architecture, configuration, the 24-hour rule, recovery and troubleshooting:
 [docs/PIPELINE.md](docs/PIPELINE.md).

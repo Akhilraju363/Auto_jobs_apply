@@ -339,18 +339,103 @@ class TestConfiguration(PipelineTestCase):
             importlib.reload(config)
 
     def test_start_local_bat(self):
+        """Menu-only launcher: no argument pass-through, SAFE forced, the menu does the rest."""
         bat = (ROOT / "start_local.bat").read_bytes()
         self.assertIn(b"\r\n", bat)
+        self.assertNotIn(b"\n", bat.replace(b"\r\n", b""))  # CRLF only
         text = bat.decode("ascii")
         self.assertIn('cd /d "%~dp0"', text)
-        self.assertIn(r".venv\Scripts\activate.bat", text)
-        self.assertIn("application_pipeline.py --check-config", text)
-        self.assertIn("application_pipeline.py %*", text)
+        self.assertIn(r'set "PY=%~dp0.venv\Scripts\python.exe"', text)
+        self.assertIn('"%PY%" "%~dp0local_launcher.py"', text)
+        self.assertIn('set "APPLICATION_MODE=SAFE"', text)
+        for setting in ('set "artifact_sync=0"', 'set "GOOGLE_SHEETS_ENABLED=false"', 'set "JOB_SOURCES=naukri"',
+                        'set "AI_AGENT_EXPORT_LIMIT=2"', 'set "APPLICATION_JOB_WINDOW_HOURS=24"',
+                        'set "AI_AGENT_STAGES=scrape_jobs.py,score_jobs.py"'):
+            self.assertIn(setting, text)
+        self.assertNotIn("tailor_job", text)  # the automatic run never tailors
+        self.assertIn('if not "%~1"=="" (', text)  # arguments are refused, never passed on
         self.assertIn("exit /b %EXITCODE%", text)
         commands = [line.strip().lower() for line in text.splitlines()
                     if line.strip() and not line.strip().lower().startswith(("rem", "echo"))]
+        self.assertFalse([c for c in commands if "%*" in c])
+        self.assertFalse([c for c in commands if "application_pipeline.py" in c])  # only through the menu
+        self.assertFalse([c for c in commands if "auto" in c.split("=")[-1] and "application_mode" in c])
         self.assertFalse([c for c in commands if "pip install" in c or "playwright install" in c])
         self.assertFalse([c for c in commands if "chrome_user_data" in c])
+        self.assertFalse([c for c in commands if ".env" in c and ("copy" in c or ">" in c)])
+
+
+class TestResumeReadinessReason(PipelineTestCase):
+    """Run 20261013T094049-dacab2: jobs 382/383 scored 8/10 in a scan-and-score run (no tailor_job.py) and
+    were reported only as 'verified resume is not ready'. The resolver's exact code and reason are now
+    part of the eligibility reason; the eligibility decision itself is unchanged."""
+
+    URL = JOB_URL.replace("900000000001", "900000000002")  # the base fixture only has a resume for ...001
+
+    def candidate(self, stages=("scrape_jobs.py", "score_jobs.py")):
+        job = self.fresh_job("900000000002", score=80.0)
+        settings = self.settings(agent_stages=list(stages))
+        result = pipeline.evaluate_candidate(job, settings, datetime.now(timezone.utc), verified=None)
+        return job, result
+
+    def test_scan_and_score_job_without_a_tailored_resume(self):
+        _, result = self.candidate()
+        self.assertFalse(result.eligible)
+        self.assertEqual(result.reason,
+                         "verified resume is not ready (RESUME_NOT_FOUND: the AI Agent has no saved tailored resume "
+                         "for this job); this workflow's AI Agent stages do not include tailor_job.py, so no resume "
+                         "is created")
+
+    def test_with_tailoring_configured_the_note_is_not_added(self):
+        _, result = self.candidate(stages=("scrape_jobs.py", "score_jobs.py", "tailor_job.py"))
+        self.assertEqual(result.reason, "verified resume is not ready (RESUME_NOT_FOUND: the AI Agent has no saved "
+                                        "tailored resume for this job)")
+
+    def test_each_resolver_failure_is_named(self):
+        cases = {
+            "only in Drive": lambda: (self.agent_out / "tailored_jobs.json").write_text(json.dumps(
+                [{"link": self.URL, "status": "saved", "resume_link": "https://drive.google.com/x"}]), encoding="utf-8"),
+            "RESUME_NOT_VERIFIED": lambda: self.make_resume(url=self.URL, ok=False, rid="r2"),
+            "RESUME_ARTIFACT_MISMATCH": lambda: (self.make_resume(url=JOB_URL, rid="aaaaaaaaaaaa"),
+                                                 (self.agent_out / "tailored_jobs.json").write_text(json.dumps(
+                                                     [{"link": self.URL, "status": "saved",
+                                                       "resume_id": "aaaaaaaaaaaa"}]), encoding="utf-8")),
+        }
+        for expected, arrange in cases.items():
+            with self.subTest(expected=expected):
+                self.setUp()  # fresh temporary database and Agent output folder per case
+                arrange()
+                _, result = self.candidate(stages=("scrape_jobs.py", "score_jobs.py", "tailor_job.py"))
+                self.assertFalse(result.eligible)
+                self.assertTrue(result.reason.startswith("verified resume is not ready ("), result.reason)
+                self.assertIn(expected, result.reason)
+
+    def test_ready_resume_and_decisions_are_unchanged(self):
+        self.make_resume(url=self.URL, rid="r2")
+        job, result = self.candidate()
+        self.assertTrue(result.eligible)
+        plain = pipeline.evaluate_job(dict(job, history_applied=False), reference_time=datetime.now(timezone.utc),
+                                      preferred_locations=[], applicant_experience=pipeline.verified_experience(
+                                          self.settings()), score_threshold=8, resume_ready=True, window_hours=24)
+        self.assertEqual((result.eligible, result.reason), (plain.eligible, plain.reason))
+
+    def test_pipeline_reports_the_exact_reason(self):
+        lines = []
+
+        def scoring_only(agent_dir, stages, export_path, python, timeout, scope_path=None):
+            exported = json.loads(Path(export_path).read_text(encoding="utf-8"))
+            scored = [dict(e, score=8, reasoning="fit", matched_must_haves=[], missing_must_haves=[]) for e in exported]
+            (self.agent_out / "scored_jobs.json").write_text(json.dumps(scored), encoding="utf-8")
+            return AgentRunResult(True, list(stages))
+
+        summary = pipeline.ApplicationPipeline(
+            self.settings(agent_stages=["scrape_jobs.py", "score_jobs.py"], sheets_enabled=False),
+            scanner_factory=lambda: FakeScanner(self, jobs=["900000000002"]), browser_factory=lambda: self.browser,
+            runner_factory=self.make_runner, agent_runner=scoring_only, prompt=lambda m: self.fail(m),
+            out=lines.append, no_apply=True).run()
+        self.assertEqual((summary.candidates, summary.eligible, self.browser.clicks), (1, 0, 0))
+        self.assertTrue(any("RESUME_NOT_FOUND: the AI Agent has no saved tailored resume for this job" in line
+                            and "do not include tailor_job.py" in line for line in lines), lines)
 
 
 if __name__ == "__main__":
