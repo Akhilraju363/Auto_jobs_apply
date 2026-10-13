@@ -152,17 +152,21 @@ def export_discovered_jobs(
     path: Optional[Path] = None,
     limit: Optional[int] = None,
     job_filter: Optional[Callable[[dict], bool]] = None,
+    order_key: Optional[Callable[[dict], Any]] = None,
+    order_label: str = "oldest first",
 ) -> ExportResult:
-    """Write up to `limit` eligible discovered jobs (oldest first) for the AI Agent to ingest.
+    """Write up to `limit` eligible discovered jobs for the AI Agent to ingest.
 
     Only status='discovered' jobs are selected, so scored jobs are never resent. The file is
     rewritten each time with the current pending jobs; jobs.db is not modified.
     job_filter (Phase 4 pipeline): only jobs it accepts are exported, e.g. fresh, never-applied jobs,
     so stale jobs never spend the small per-run AI Agent budget.
+    order_key: which jobs get the `limit` slots first (default: jobs.id, i.e. oldest stored first; the
+    pipeline passes export_priority.relevance_order). It changes the order only, never which jobs qualify.
     """
     init_db()
     result = ExportResult(path=Path(path or NAUKRI_EXPORT_PATH), limit=limit or AI_AGENT_EXPORT_LIMIT)
-    jobs = sorted(get_jobs(status=JOB_STATUS_DISCOVERED), key=lambda j: j["id"])
+    jobs = sorted(get_jobs(status=JOB_STATUS_DISCOVERED), key=order_key or (lambda j: j["id"]))
     result.discovered = len(jobs)
     if job_filter is not None:
         kept = [job for job in jobs if job_filter(job)]
@@ -187,7 +191,7 @@ def export_discovered_jobs(
             result.exported.append(record)
             result.decisions.append((job["id"], "EXPORTED", ""))
         else:
-            reason = f"export limit reached (AI_AGENT_EXPORT_LIMIT={result.limit}; oldest first)"
+            reason = f"export limit reached (AI_AGENT_EXPORT_LIMIT={result.limit}; {order_label})"
             result.deferred.append((reference, reason))
             result.decisions.append((job["id"], "DEFERRED", reason))
             logger.info(f"Deferred {reference}: {reason}")

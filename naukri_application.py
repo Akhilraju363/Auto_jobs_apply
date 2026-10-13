@@ -63,7 +63,7 @@ from experience_check import (
     check_experience,
     verified_resume_experience,
 )
-from naukri_parser import detect_block, is_login_page
+from naukri_parser import detect_block, extract_job_id, is_login_page
 from resume_artifact import RESUME_ARTIFACT_MISMATCH, RESUME_PDF_NOT_FOUND, resolve_verified_resume
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,7 @@ UNKNOWN_UI_STATE = "UNKNOWN_UI_STATE"
 BROWSER_PROFILE_LOCKED = "BROWSER_PROFILE_LOCKED"
 NOT_APPROVED = "NOT_APPROVED"
 APPLIED = "APPLIED"
+JOB_IDENTITY_MISMATCH = "JOB_IDENTITY_MISMATCH"  # the opened page is not provably the intended Naukri job
 
 UPLOADABLE_RESUME_TYPES = (".pdf", ".doc", ".docx")
 REVIEWABLE_RESUME_TYPES = UPLOADABLE_RESUME_TYPES + (".md",)
@@ -928,6 +929,27 @@ class ApplicationRunner:
         self.debug_dir: Optional[Path] = None  # None: APPLICATION_DEBUG_DIR
         self._attempt_id: Optional[int] = None  # the open application_attempts row (non-dry runs)
         self._clicked = False  # True from just before the Apply click: the outcome may be a submission
+        # True (auto-apply): before the review/Apply step the opened page's Naukri job id must equal the
+        # intended job's; anything else stops that job as requires_manual_action (JOB_IDENTITY_MISMATCH).
+        self.require_job_identity = False
+        self.identity_checks: dict = {}  # jobs.id -> {"expected", "found", "url", "verified"}
+
+    def check_job_identity(self, job: dict) -> Optional[str]:
+        """None when the opened page is provably the intended job (same Naukri job id in the landed URL);
+        otherwise the reason. A title or company match is never treated as proof."""
+        expected = extract_job_id(job.get("url"), job.get("job_id"))
+        landed_url = str((self.browser.snapshot() or {}).get("url") or "")
+        found = extract_job_id(landed_url)
+        verified = bool(expected) and expected == found
+        self.identity_checks[job["id"]] = {"expected": expected, "found": found, "url": landed_url,
+                                           "verified": verified}
+        if verified:
+            return None
+        if not expected:
+            return "the intended job has no Naukri job id to verify against"
+        if not found:
+            return f"the opened page's Naukri job id could not be read (expected {expected}; landed on {landed_url})"
+        return f"the opened page is Naukri job {found}, not the intended job {expected} ({landed_url})"
 
     # -- attempt lifecycle, events, diagnostics ------------------------------------------
 
@@ -1143,6 +1165,11 @@ class ApplicationRunner:
         if assessment.state != "ready":
             return self._result(job, assessment.state, assessment.code, assessment.reason,
                                 external_url=assessment.external_url, resume=resume)
+        if self.require_job_identity:  # before the review, the attempt log and any click
+            mismatch = self.check_job_identity(job)
+            if mismatch:
+                self.out(f"[{job['id']}] {job['title']} @ {job['company']}: not applied: {mismatch}")
+                return self._result(job, "requires_manual_action", JOB_IDENTITY_MISMATCH, mismatch, resume=resume)
 
         self.out(format_review(job, resume, assessment))
         self._event("REVIEW_SHOWN", job, "review_required")

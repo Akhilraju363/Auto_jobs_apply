@@ -1,19 +1,234 @@
 # Local pipeline (Phase 4)
 
-One command runs the whole Naukri workflow on this machine:
+Double-click to scan and score automatically:
 
 ```bat
 C:\Users\akhil\Auto_job_apply\start_local.bat
 ```
 
-`start_local.bat` validates the setup and runs `python application_pipeline.py`. The pipeline only
-sequences the existing Phase 1-3.4 services; it has no scoring, tailoring, state system or browser
-logic of its own.
+`start_local.bat` checks `.venv`, Python 3.11+, the packages and `.env`, then runs `local_launcher.py`,
+which starts the **automatic scan-and-score run** (below). The pipeline (`application_pipeline.py`) only
+sequences the existing Phase 1-3.4 services; it has no scoring, tailoring, state system or browser logic
+of its own.
+
+## Automatic scan and score (start_local.bat)
+
+Double-clicking `start_local.bat` shows no menu and asks nothing. It runs exactly menu option 2
+(scan and score only):
+
+1. Takes the run lock (`output\runs\.launcher.lock`). If another launcher run holds it, it stops with
+   exit code 1 and creates no folder.
+2. Creates a new run folder `output\runs\<run id>\` and writes `launcher.log` there.
+3. Runs the read-only launcher checks (Agent folder, `AI_AGENT_OUTPUT_DIR`, Agent Python, `artifacts.py`
+   honours `artifact_sync`, no `artifact_sync` in this `.env`, packages, `.env`). A failure stops here.
+4. Runs `application_pipeline.py --check-config` (read-only: the database is opened read-only, nothing
+   is created, migrated or written). A failure stops here.
+5. Runs `application_pipeline.py --no-apply --workflow scan-and-score --wait-for-login --run-dir <folder>`:
+   session check, scan, freshness / experience / location filters, save, export at most 2, scope file,
+   Agent `scrape_jobs.py` + `score_jobs.py` (scoped), import scores, eligibility report. It writes
+   `run.log` and `result.json`. If nothing is exported, the Agent is not started.
+6. Prints the exit code, run ID, Agent export ID and report/log paths. The window stays open when
+   double-clicked.
+
+If step 3 or 4 fails, the launcher writes `result.json` itself (`status: failed`, later steps
+`NOT RUN`, counts `null`, `recorded_by: local_launcher`). If the pipeline ends without a report, the
+launcher records `status: crashed` and the run is never reported as successful. Nothing is retried.
+
+**Login.** The saved `chrome_user_data/` profile is reused. If the session check lands on Naukri's login
+page, `--wait-for-login` opens the login page in the same visible browser. You log in yourself, including
+any OTP or CAPTCHA; nothing is typed, stored or bypassed. The pipeline waits up to
+`NAUKRI_LOGIN_WAIT_MINUTES` (default 10) once, then continues. If you don't log in, the run continues
+as before (`Naukri login: AUTH_REQUIRED`, exit code 2) and the scan stops at a login page if Naukri
+shows one.
+
+The same settings as option 2 are enforced (table below), plus `AI_AGENT_STAGES=scrape_jobs.py,score_jobs.py`.
+`start_local.bat` also sets them in its own process. Tailoring, Drive uploads, Sheets sync and
+applications are never part of it.
+
+## Auto-apply (opt-in)
+
+Automatic applications are **off** unless you create `launcher_workflow.json` in the project folder
+containing exactly:
+
+```json
+{"workflow": "auto-apply"}
+```
+
+Nothing else selects auto-apply: no `.env` key, no environment variable, no argument. No file means
+scan and score only. A file with anything else (bad JSON, another value, extra keys) makes
+`start_local.bat` stop without running anything. The file is git-ignored. Delete it to go back.
+
+**Prerequisite (unchanged AUTO readiness gate).** AUTO mode is refused (the configuration check fails, so
+the launcher stops before Chrome opens) until at least one application made in SAFE mode has been
+confirmed by Naukri. Do that once yourself:
+`.venv\Scripts\python.exe application_pipeline.py`, approve one job with `y` at the review, and check
+it with `python main.py --action application-status`.
+
+**What an auto-apply run does.** The launcher steps are the same (lock, run folder, read-only checks,
+read-only configuration check). The pipeline then runs as
+`--workflow auto-apply --wait-for-login --run-dir <folder>` with:
+
+| Setting | Value |
+|---|---|
+| `APPLICATION_MODE` | `AUTO` |
+| Agent stages | `scrape_jobs.py,score_jobs.py,tailor_job.py` (scoped to this run) |
+| `AI_AGENT_EXPORT_LIMIT` / `APPLICATION_JOB_WINDOW_HOURS` | `2` / `24` |
+| `APPLICATION_SCORE_THRESHOLD` | at least `8` (a stricter `.env` value is kept) |
+| `APPLICATION_MAX_JOBS` | **your `.env` value, never raised** (must be 1-2, else the run is refused) |
+| `GOOGLE_SHEETS_ENABLED` / `artifact_sync` | `false` / `0` (outcomes stay queued for a later `--sync-only`) |
+
+Tailoring may create a Google Drive folder, a temporary Google Doc and the resume PDF upload when the
+Agent has `google_drive_folder_id` (required: the launcher checks the key name). `workflow_guard` refuses
+the run if any value above differs. Experience, location, freshness and history rules are unchanged.
+
+**Which jobs.** Only jobs **exported by this run**. Before eligibility, the run's scope file is read
+again and must carry this run's `run_id` and exactly the exported job ids. If it doesn't, nothing is
+applied (no fallback). Recommended jobs from earlier runs are counted (`candidates_outside_run`) and left
+untouched. A job that is recovery-required, already applied, or has an open attempt or an unconfirmed
+record is excluded (`get_application_candidates`) and refused again by the runner's idempotency check.
+
+**Per job** (`ApplicationRunner.process`, unchanged except for the identity check):
+
+1. Experience gate.
+2. Verified resume for this exact job.
+3. Open the job page and assess it (login, CAPTCHA, closed, already applied, external).
+4. **Identity check (auto-apply only).** The Naukri job id in the opened page's URL must equal the
+   exported job's id. If it doesn't, or can't be read, the job becomes `requires_manual_action` /
+   `JOB_IDENTITY_MISMATCH` with both ids and the URL recorded. Nothing is clicked and no other listing is
+   tried.
+5. The review is approved automatically.
+6. Apply is marked as clicked before the click, then Naukri's own Apply is clicked.
+7. Forms are submitted only when every field was planned from your `APPLICANT_*` facts. Any other
+   question is left for manual completion and never guessed.
+8. Only the verified job-specific resume is uploaded.
+9. `applied` is recorded only on Naukri's confirmation. Anything uncertain after the click becomes
+   `recovery_required` and is never retried.
+
+**Interruptions.**
+
+- **CAPTCHA before Apply:** a real pause. Complete it in the browser and press Enter, or `q` to stop.
+  If the page is still a verification page after that, the job is not applied.
+- **Login:** `--wait-for-login` handles the session check. A login page on a job stops the applications.
+- **Stopping rule:** after `AUTH_REQUIRED`, `CAPTCHA_REQUIRED` or `APPLICATION_STATUS_UNKNOWN`, no further
+  application is attempted in that run (`NOT_ATTEMPTED`).
+
+**Reporting.** `result.json` adds `scope_validation`, `candidates_outside_run`, `eligibility_results`
+(score, freshness, experience, location, `resume_ready` per current-run job), `applications`, and
+`application_outcomes`. Each `applications` entry has the outcome (`APPLIED_CONFIRMED`,
+`APPLICATION_FAILED`, `APPLICATION_SKIPPED`, `AUTH_REQUIRED`, `CAPTCHA_REQUIRED`,
+`APPLICATION_STATUS_UNKNOWN`), state, code, reason, `identity_check`, resume version/type, and
+`manual_completion_required`. These fields are `null` in non-auto-apply runs and when a step did not run.
+The CLI's `APPLICATION_MODE=AUTO` behaviour (`mode_prompt`) is unchanged.
+
+## Developer menu (local_launcher.py --menu)
+
+`.venv\Scripts\python.exe local_launcher.py --menu` opens the previous interactive menu (options 1-5
+below). `local_launcher.py` refuses any other argument. `start_local.bat` refuses all arguments.
+
+**No menu option submits an application.** The menu has no apply path. Every pipeline run started
+from it uses `--no-apply` and `APPLICATION_MODE=SAFE`. Independently of the launcher,
+`application_pipeline.py` refuses a menu workflow (`--workflow scan-and-score|full-preparation`) unless
+`--no-apply`, SAFE, Google Sheets off, `artifact_sync=0`, export cap 2, 24-hour window and scoped Agent
+stages all hold (`workflow_guard`). Submitting applications is a separate, developer-CLI step (below)
+that always asks for your `y`.
+
+`start_local.bat` takes no arguments; with any argument it stops (exit code 1) without running
+anything. It works from any folder and from paths with spaces. In the developer menu, Enter or
+anything other than `1`-`5` selects nothing.
+
+| Option | What it runs | Naukri / Chrome | LLM | Local writes | Google Drive | Google Sheets |
+|---|---|---|---|---|---|---|
+| 1 Configuration check | launcher checks + `application_pipeline.py --check-config` | no | no | **none** (database opened read-only) | no | no |
+| 2 Scan and score only | `--no-apply --workflow scan-and-score`, Agent stages `scrape_jobs.py,score_jobs.py` | **yes**: live scan with the saved `chrome_user_data/` profile | **yes**: scoring, at most 2 jobs | SQLite, `exports/naukri_jobs.json`, `exports/agent_job_scope.json`, Agent `output/raw_jobs.json`, `scored_jobs.json`, `scoped_run_report.json`, `output/runs/<run id>/` | **no** | **no** |
+| 3 Full preparation | `--no-apply --workflow full-preparation`, Agent stages from `AI_AGENT_STAGES` (default scrape, score, tailor) | **yes**, as option 2 | **yes**: scoring (at most 2 jobs) and tailoring for each that scores 8+ | as option 2, plus the Agent's `output/generated_resumes/`, `tailored_jobs.json` | **yes, when the Agent has `google_drive_folder_id`**: a folder per job, a temporary Google Doc to render the PDF, and the resume PDF upload | **no** |
+| 4 View previous run | `application_pipeline.py --last-run` | no | no | **none** | no | no |
+| 5 Exit | nothing | no | no | none | no | no |
+
+**Confirmations.** Option 2 shows what it will do and runs only after `y` (or `yes`). Option 3 lists its
+side effects (live scan, database and file updates, LLM use and possible cost, tailored resumes, Drive
+uploads) and runs only when you type exactly `YES` (capitals, nothing else). Anything else cancels.
+
+**Settings the menu enforces.** These are set in the child process environment only. `.env` is never
+edited, and python-dotenv (this project and the Agent) never overrides a variable that is already set.
+
+| Setting | Value | Why |
+|---|---|---|
+| `APPLICATION_MODE` | `SAFE` | never AUTO |
+| `artifact_sync` | `0` | the Agent does not mirror `raw/scored/tailored_jobs.json` to Drive (`scripts/artifacts.py`). Resume uploads in option 3 are separate `tailor_job.py` calls and are not affected |
+| `GOOGLE_SHEETS_ENABLED` | `false` | no Sheets sync; rows already queued in `sheet_sync` stay `PENDING` for a later, separate `--sync-only` |
+| `JOB_SOURCES` | `naukri` | no LinkedIn/Apify scrape (the bridge sets it as well) |
+| `AI_AGENT_EXPORT_LIMIT` | `2` | at most 2 jobs scored/tailored per run |
+| `APPLICATION_JOB_WINDOW_HOURS` | `24` | the 24-hour freshness rule |
+| `AI_AGENT_STAGES` | option 2: `scrape_jobs.py,score_jobs.py`; option 3: the configured value | option 3 is blocked if a configured stage cannot be scoped |
+
+The experience rule (the master resume's verified 4+ years), current-run scope enforcement and history
+preservation are not settings. They are unchanged.
+
+**Blocked options.** At start the launcher checks, read-only: Python and packages, `.env`, that
+`AI_AGENT_DIR` is the AI Agent checkout (`scripts/scrape_jobs.py`, `score_jobs.py`, `tailor_job.py`,
+`job_scope.py`, `artifacts.py`), that `AI_AGENT_OUTPUT_DIR` is exactly `<AI_AGENT_DIR>\output` and
+exists, the Agent's Python, that the Agent's `artifacts.py` honours `artifact_sync`, and that this
+project's `.env` does **not** define `artifact_sync` (the bridge drops every key named in this `.env`
+before starting the Agent, so it would cancel `artifact_sync=0`). A failure blocks options 2 and 3, or
+only option 3 for unscoped `AI_AGENT_STAGES`. Options 1, 4 and 5 always work.
+
+**One run at a time.** The automatic run and menu options 2 and 3 hold an OS lock on `output\runs\.launcher.lock` while they run.
+A second launcher refuses to start a run. The OS releases the lock when the process ends, even after a
+crash. The empty lock file stays and is harmless. Direct CLI runs do not take this lock.
+
+**After each run** the launcher shows the process's real exit code and its meaning, the run ID, the
+Agent export ID, the report and log paths, and `RUN COMPLETE` only for exit code 0. A missing or
+unfinished report, or a report that disagrees with the exit code, is called out. Nothing is retried.
+
+### Run logs and reports
+
+The automatic run and menu options 2 and 3 record each run in a new folder `output\runs\<YYYYmmddTHHMMSS>-<random>\` (git-ignored).
+Folders are created atomically and never reused, and older runs are never deleted.
+
+- `run.log`: everything printed to the console during the run (progress, log records, warnings,
+  tracebacks), including the AI Agent stages' own output and errors (UTF-8).
+- `result.json`: written with `"status": "running"` when the run starts and replaced atomically when it
+  ends. A run that was killed keeps an honest, incomplete report.
+
+| `result.json` field | Content |
+|---|---|
+| `run_id`, `started_at`, `finished_at`, `duration_seconds` | run folder name; local time with UTC offset |
+| `status` | `running` (never finished), `complete`, `attention`, `failed`, `interrupted`, `crashed` |
+| `workflow`, `application_mode`, `no_apply`, `options` | `scan-and-score` / `full-preparation` / `cli`; the pipeline flags |
+| `effective_settings` | stages, export cap, window, threshold, Sheets on/off, `artifact_sync` (no secrets) |
+| `exit_code`, `exit_meaning` | `0` complete, `1` configuration invalid or unrecoverable error, `2` needs attention |
+| `stages` | per step: configuration, Naukri session, scan, export, AI Agent, applications, Sheets (`NOT RUN` when a step never started) |
+| `agent_export_id`, `exported_job_ids` | the scope file's `run_id` and the `jobs.id`s exported this run |
+| `agent_scope_report` | the Agent's own report for this run, when it wrote one |
+| `counts` | the summary counts. **`null` = unknown** (step not run, crashed run), never a fake 0 |
+| `warnings`, `fatal`, `error`, `summary_text`, `log_file`, `report_file` | as printed |
+
+`--last-run` (menu option 4, or `.venv\Scripts\python.exe application_pipeline.py --last-run`) shows the newest report under `output\runs\`. A newer folder without a readable
+report is named and skipped, and an unfinished report is shown with a warning. It only reads: no
+database, browser, network, new folder or file.
+
+### Developer CLI (no menu)
+
+`application_pipeline.py` can still be run directly. Its flags are unchanged, apart from
+`--check-config`, which is now read-only. Use the project's interpreter:
+
+```bat
+.venv\Scripts\python.exe application_pipeline.py --check-config      :: read-only configuration check
+.venv\Scripts\python.exe application_pipeline.py --last-run          :: newest run report (read-only)
+.venv\Scripts\python.exe application_pipeline.py --dry-run           :: open and check jobs; never click Apply, export, run the Agent or write Sheets
+.venv\Scripts\python.exe application_pipeline.py --no-apply          :: scan + score + eligibility only
+.venv\Scripts\python.exe application_pipeline.py                     :: full run INCLUDING applications (SAFE: each needs your y)
+.venv\Scripts\python.exe application_pipeline.py --sync-only         :: retry queued Google Sheets rows
+```
+
+`--run-dir DIR` records any CLI run like the menu does (DIR must not already hold `run.log` or
+`result.json`). These commands use `.env` as it is. The menu's enforced settings do **not** apply, so
+Sheets sync and the Agent's Drive mirroring follow `.env` and the Agent's own configuration.
 
 ## Architecture
 
 ```
-start_local.bat
+start_local.bat → local_launcher.py              (menu; preparation only, --no-apply)
   └─ application_pipeline.py                     (orchestrator)
        1  validate configuration                  validate_configuration()
        2  verify Naukri session                   NaukriApplicationBrowser.session_state()  (read-only)
@@ -130,8 +345,16 @@ Every count is about **this run** unless it says "all runs".
 - **Export to AI Agent (this run)**, unscored jobs only: not fresh -> never exported; experience
   INELIGIBLE / REVIEW_REQUIRED -> never exported (reason printed per job); the rest are "fresh,
   experience-eligible" and each prints one line: `EXPORTED`, `DEFERRED` (past `AI_AGENT_EXPORT_LIMIT`;
-  oldest first; stays unscored and is offered again on a later run while still fresh) or `REJECTED`
-  (e.g. description under 80 characters).
+  stays unscored and is offered again on a later run while still fresh) or `REJECTED`
+  (e.g. description under 80 characters), with its rank in brackets.
+- **Export order** (`export_priority.py`, pipeline only). The cap's slots go first to the target roles
+  by title tier: Java with Spring/Spring Boot/Backend/Full Stack, then Java Developer, then Full Stack,
+  then generic developer titles with Java skills. Testing/QA titles and titles naming another stack
+  rank last. Within a tier: more distinct matching skills (Java, Spring Boot, Spring, Microservices,
+  REST, Hibernate, JPA, J2EE, Angular, React, SQL, Kafka, JUnit; "JavaScript" is never Java), then the
+  older posting (closer to leaving the 24-hour window; unknown age last), then `jobs.id`. Ranking only
+  orders jobs that already passed every check; it never makes a job eligible.
+  `main.py --action export-to-agent` keeps the plain `jobs.id` order.
 - **AI Agent (this run's exported jobs only)**: from the Agent's report for this run
   (`output/scoped_run_report.json`, matched by run id): newly scored, newly tailored, already processed
   (skipped), below the 8+ cutoff, not in the Agent store, failed/flagged. "unknown" means the Agent
@@ -227,21 +450,26 @@ without clicking anything and settles it with you. The pipeline never resubmits 
 
 ## Commands
 
+`start_local.bat` is the automatic scan and score (no arguments); `local_launcher.py --menu` is the
+developer menu. Direct pipeline commands (developer CLI, run from
+the project folder):
+
 ```bat
-start_local.bat                     :: full run (SAFE unless APPLICATION_MODE=AUTO)
-start_local.bat --dry-run           :: open and check jobs; never click Apply, export, run the Agent or write Sheets
-start_local.bat --no-apply          :: scan + score + eligibility only (no application browser)
-start_local.bat --skip-scan         :: use the jobs already in SQLite
-start_local.bat --skip-agent        :: do not run the AI Agent (scores already produced are still imported)
-start_local.bat --sync-only         :: only retry pending Google Sheets rows
-python application_pipeline.py --check-config
+.venv\Scripts\python.exe application_pipeline.py                  :: full run (SAFE unless APPLICATION_MODE=AUTO)
+.venv\Scripts\python.exe application_pipeline.py --dry-run        :: open and check jobs; never click Apply, export, run the Agent or write Sheets
+.venv\Scripts\python.exe application_pipeline.py --no-apply       :: scan + score + eligibility only (no application browser)
+.venv\Scripts\python.exe application_pipeline.py --skip-scan      :: use the jobs already in SQLite
+.venv\Scripts\python.exe application_pipeline.py --skip-agent     :: do not run the AI Agent (scores already produced are still imported)
+.venv\Scripts\python.exe application_pipeline.py --sync-only      :: only retry pending Google Sheets rows
+.venv\Scripts\python.exe application_pipeline.py --check-config   :: read-only configuration check
+.venv\Scripts\python.exe application_pipeline.py --last-run       :: newest run report (read-only)
 ```
 
-Exit codes: `0` run complete, `1` setup/configuration problem (nothing applied), `2` finished but
+Exit codes: `0` run complete, `1` setup/configuration problem or unrecoverable error, `2` finished but
 something needs you (login, recovery, failure, AI Agent error, stopped run).
 
-`start_local.bat` never installs packages, never touches `chrome_user_data/` and never resets the
-Naukri login. When double-clicked it keeps the window open to read the summary.
+`start_local.bat` never installs packages, never touches `chrome_user_data/`, never edits `.env` and
+never resets the Naukri login. When double-clicked it keeps the window open to read the summary.
 
 ## Configuration
 
@@ -265,8 +493,9 @@ Naukri login. When double-clicked it keeps the window open to read the summary.
 
 ## Before trusting AUTO
 
-1. `start_local.bat --dry-run` and check the summary and the jobs it would apply to.
-2. `start_local.bat` in SAFE mode, approve exactly **one** job, and confirm it on Naukri, in
+1. `.venv\Scripts\python.exe application_pipeline.py --dry-run` and check the summary and the jobs it
+   would apply to.
+2. `.venv\Scripts\python.exe application_pipeline.py` in SAFE mode, approve exactly **one** job, and confirm it on Naukri, in
    `python main.py --action application-status --job-id <id>` and in the Sheet.
 3. Only then consider `APPLICATION_MODE=AUTO` (the pipeline enforces step 2).
 
@@ -275,6 +504,9 @@ Naukri login. When double-clicked it keeps the window open to read the summary.
 | Symptom | Fix |
 |---|---|
 | `[FAIL] .venv not found` / missing packages | create the venv and install `requirements.txt` once (the launcher never installs) |
+| Launcher: `Option 2/3 is blocked` | run option 1; fix each `FAIL` line (Agent paths, artifacts.py, `artifact_sync` in this `.env`, stages) |
+| Launcher: `Another launcher run is in progress` | another launcher is running option 2 or 3; wait for it (a crashed one releases the lock automatically) |
+| `workflow ... refused` | a menu workflow was started without its safety settings; use `start_local.bat`, or run the CLI without `--workflow` |
 | `Naukri login: AUTH_REQUIRED` | `python main.py --action naukri-login`, log in by hand, rerun |
 | `BROWSER_PROFILE_LOCKED` | close other Chromium windows using `chrome_user_data/` |
 | `AI Agent: AGENT_NOT_CONFIGURED` | set `AI_AGENT_OUTPUT_DIR` in `.env` |

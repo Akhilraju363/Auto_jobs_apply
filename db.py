@@ -472,6 +472,42 @@ def count_successful_applications() -> int:
         return conn.execute("SELECT COUNT(*) FROM applied_jobs WHERE status = ?", (APPLIED_STATUS,)).fetchone()[0]
 
 
+# The tables init_db() creates; a database missing any of them is completed by the next init_db().
+REQUIRED_TABLES = ("applied_jobs", "jobs", "application_attempts", "sheet_sync")
+
+
+def inspect_database_readonly() -> dict:
+    """What init_db() would find, without creating, migrating or writing anything.
+
+    The file is opened with SQLite's read-only URI mode (mode=ro), which never creates the file,
+    a journal or a table. Returns {path, exists, legacy_migration_pending, tables, missing_tables,
+    confirmed_applications, error}; values that could not be read are None, never 0."""
+    target = Path(DB_PATH)
+    info = {
+        "path": str(target),
+        "exists": target.is_file(),
+        "legacy_migration_pending": (not target.exists() and Path(LEGACY_DB_PATH).exists()
+                                     and target.resolve() == Path(DEFAULT_DB_PATH).resolve()),
+        "tables": None,
+        "missing_tables": None,
+        "confirmed_applications": None,
+        "error": None,
+    }
+    if not info["exists"]:
+        return info
+    try:
+        with closing(sqlite3.connect(f"{target.resolve().as_uri()}?mode=ro", uri=True)) as conn:
+            tables = sorted(row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'"))
+            info["tables"] = tables
+            info["missing_tables"] = [name for name in REQUIRED_TABLES if name not in tables]
+            if "applied_jobs" in tables:
+                info["confirmed_applications"] = conn.execute(
+                    "SELECT COUNT(*) FROM applied_jobs WHERE status = ?", (APPLIED_STATUS,)).fetchone()[0]
+    except sqlite3.Error as e:
+        info["error"] = f"{type(e).__name__}: {e}"
+    return info
+
+
 def get_application_candidates(
     include_review: bool = False, job_row_id: Optional[int] = None, limit: Optional[int] = None
 ) -> list[dict]:

@@ -26,3 +26,6 @@ output/
 # Runtime logs and temporary files
 *.log
 *.tmp
+
+# Your local start_local.bat workflow choice (opt-in auto-apply); never committed
+launcher_workflow.json

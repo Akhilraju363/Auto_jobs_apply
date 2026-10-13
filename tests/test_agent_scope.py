@@ -153,11 +153,24 @@ class TestScopedPipeline(ScopedPipelineCase):
         later = self.fresh("900000000722", posted_label="2 hours ago")
         expiring = self.fresh("900000000723", posted_label="20 hours ago")
         self.run_scoped(limit=2, clock=lambda: now)
-        self.assertEqual(self.scope_ids(), [early[0]["job_id"], early[1]["job_id"]])
-        summary = self.run_scoped(limit=2, clock=lambda: now + timedelta(hours=6))  # "20 hours ago" is now stale
-        self.assertEqual(self.scope_ids(), [later["job_id"]])
+        # Equal role relevance and skills (export_priority): the job closest to leaving the 24-hour window
+        # goes first, then the lowest id -- before relevance ordering, the 20-hour job was deferred and expired.
+        self.assertEqual(self.scope_ids(), [expiring["job_id"], early[0]["job_id"]])
+        summary = self.run_scoped(limit=2, clock=lambda: now + timedelta(hours=6))
+        self.assertEqual(self.scope_ids(), [early[1]["job_id"], later["job_id"]])  # deferred ones offered again
+        self.assertEqual(summary.not_fresh_unscored, 0)
+        self.assertEqual(db.get_job(expiring["id"])["status"], "scored")  # scored before it expired
+
+    def test_a_deferred_job_that_goes_stale_is_kept_but_not_exported(self):
+        now = datetime.now(timezone.utc)
+        first = self.fresh("900000000731", posted_label="22 hours ago")
+        deferred = self.fresh("900000000732", posted_label="20 hours ago")
+        self.run_scoped(limit=1, clock=lambda: now)
+        self.assertEqual(self.scope_ids(), [first["job_id"]])
+        summary = self.run_scoped(limit=1, clock=lambda: now + timedelta(hours=6))  # "20 hours ago" is now stale
+        self.assertEqual(summary.exported, 0)
         self.assertEqual(summary.not_fresh_unscored, 1)
-        self.assertEqual(db.get_job(expiring["id"])["status"], "discovered")  # kept, just no longer exported
+        self.assertEqual(db.get_job(deferred["id"])["status"], "discovered")  # kept, just no longer exported
 
     def test_repeated_runs_count_only_their_own_work(self):
         self.fresh("900000000730")
